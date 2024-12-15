@@ -25,6 +25,7 @@ The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickl
 
 Install the following libraries using pip:
 
+- `rvc` - Currently, there is a requirement of python & pip versions, see requirements
 - `numpy`
 - `PySide6`
 - `pyaudio`
