@@ -1,0 +1,49 @@
+# Python virtual environment
+venv/
+
+# PyCharm and IDE files
+.idea/
+*.iml
+
+# Compiled Python files
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# Video and audio files
+*.mp4
+*.wav
+*.mp3
+
+# Model and asset files
+assets/hubert/
+assets/models/
+assets/pretrained/
+assets/rmvpe/
+assets/uvr5_weights/
+assets
+
+# Temporary and processed files
+recordings/
+processed/
+preview.wav
+original.wav
+output*.wav
+output*.mp3
+temp_record.wav
+
+# Logs and debug
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Project metadata
+project.json
+
+# Test files
+tests.py
