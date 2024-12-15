@@ -21,6 +21,7 @@ The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickl
 - Python 3.10
 - Pip 24.0
 
+
 ### Dependencies
 
 Install the following libraries using pip:
@@ -58,6 +59,13 @@ Additionally, ensure **FFmpeg** is installed and available in your system's PATH
    python -m ensurepip
    python -m pip install --upgrade pip
    ```
+
+4. Initialize/Install models
+
+   ```bash
+   python full_init.py
+   ```
+
 ---
 
 ## Usage
