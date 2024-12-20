@@ -17,6 +17,7 @@ The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickl
 
 - Python 3.10
 - Pip 24.0
+- FFmpeg
 
 ### Dependencies
 
@@ -27,8 +28,10 @@ Install the following libraries using pip:
 - `pyaudio`
 - `scipy`
 - `librosa`
+- `onnxruntime`
 - `soundfile`
 - `python-dotenv`
+- `audio-separator`
 
 Additionally, ensure **FFmpeg** is installed and available in your system's PATH.
 
@@ -114,3 +117,4 @@ We welcome contributions!
 - **PySide6** for the GUI framework.
 - **FFmpeg** for video and audio processing.
 - **RVC** for voice conversion.
+- **audio-separator** for vocal removal.

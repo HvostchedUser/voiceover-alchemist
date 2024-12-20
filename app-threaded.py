@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from multiprocessing import Queue
 from platform import release
 import sys
 import os
@@ -13,6 +14,8 @@ import numpy as np
 import queue
 import tempfile
 import uuid
+from threading import Lock
+from threading import Thread  # Add this import statement
 
 from PySide6.QtCore import (
     Qt, QUrl, QThread, Signal, Slot, QObject, QMetaObject, QTimer
@@ -463,7 +466,7 @@ class RecordingWorker(threading.Thread):
     def stop(self):
         self._stop_flag.set()
 
-class ProcessingThread(threading.Thread):
+class ProcessingThread(Thread):
     def __init__(self, project_dir, orig_sr, orig_channels, segment, callback, error_callback):
         super().__init__()
         self.project_dir = project_dir
@@ -529,15 +532,48 @@ class ProcessingThread(threading.Thread):
         except Exception as e:
             self.error_callback(f"Error processing segment: {str(e)}")
 
-class CombineThread(threading.Thread):
-    def __init__(self, project_dir, orig_sr, orig_channels, segments, callback, error_callback):
+
+class ProcessingThreadQueue:
+    def __init__(self):
+        self.queue = []  # Use a list to store tasks
+        self.lock = Lock()
+        self.active_thread = None
+
+    def add_to_queue(self, project_dir, orig_sr, orig_channels, segment, callback, error_callback):
+        with self.lock:
+            self.queue.append((project_dir, orig_sr, orig_channels, segment, callback, error_callback))
+        self._start_next()
+
+    def _start_next(self):
+        with self.lock:
+            if self.active_thread is not None and self.active_thread.is_alive():
+                return  # A thread is already running
+
+            if self.queue:  # Start the next task in the queue
+                project_dir, orig_sr, orig_channels, segment, callback, error_callback = self.queue.pop(0)
+                self.active_thread = ProcessingThread(
+                    project_dir, orig_sr, orig_channels, segment, callback, error_callback
+                )
+                self.active_thread.start()
+    def _on_thread_complete(self, callback, error_callback):
+        try:
+            callback()  # Call the success callback
+        except Exception as e:
+            error_callback(str(e))  # Handle errors
+        finally:
+            with self.lock:
+                self.active_thread = None  # Reset active thread
+                self._start_next()  # Start the next task
+
+    
+class CombineThread(Thread):
+    def __init__(self, project_dir, orig_sr, orig_channels, segments, callback):
         super().__init__()
         self.project_dir = project_dir
         self.orig_sr = orig_sr
         self.orig_channels = orig_channels
         self.segments = segments
         self.callback = callback
-        self.error_callback = error_callback
 
     def run(self):
         try:
@@ -547,6 +583,42 @@ class CombineThread(threading.Thread):
             self.callback()
         except Exception as e:
             self.error_callback(str(e))
+
+
+
+class CombineThreadQueue:
+    def __init__(self):
+        self.queue = []  # Use a list to store tasks
+        self.lock = Lock()
+        self.active_thread = None
+
+    def add_to_queue(self, project_dir, orig_sr, orig_channels, segments, callback, error_callback):
+        with self.lock:
+            self.queue.append((project_dir, orig_sr, orig_channels, segments, callback, error_callback))
+        self._start_next()
+
+    def _start_next(self):
+        with self.lock:
+            if self.active_thread is not None and self.active_thread.is_alive():
+                return  # A thread is already running, do nothing
+
+            if self.queue:  # If the queue has pending tasks
+                project_dir, orig_sr, orig_channels, segments, callback, error_callback = self.queue.pop(0)
+                self.active_thread = CombineThread(
+                    project_dir, orig_sr, orig_channels, segments,
+                    lambda: self._on_thread_complete(callback, error_callback)
+                )
+                self.active_thread.start()
+
+    def _on_thread_complete(self, callback, error_callback):
+        try:
+            callback()  # Call the success callback
+        except Exception as e:
+            error_callback(str(e))  # Handle errors
+        finally:
+            with self.lock:
+                self.active_thread = None  # Reset active thread
+                self._start_next()  # Start the next task
 
 class ExportVideoWorker(threading.Thread):
     def __init__(self, video_path, preview_audio_path, orig_sr, output_path, callback, error_callback):
@@ -630,6 +702,10 @@ class MainWindow(QMainWindow):
         self.player_video.durationChanged.connect(self.on_duration_changed)
         self.timeline_slider.sliderMoved.connect(self.on_slider_moved)
         self.segment_list.itemClicked.connect(self.on_segment_selected)
+
+        # Setup CombineThreadQueue
+        self.combine_thread_queue = CombineThreadQueue()
+        self.processing_thread_queue = ProcessingThreadQueue()
 
         # Layout setup
         controls_layout = QHBoxLayout()
@@ -735,7 +811,7 @@ class MainWindow(QMainWindow):
             if self.combine_thread and self.combine_thread.is_alive():
                 print("Combine thread is already running.")
             else:
-                self.combine_thread = CombineThread(
+                self.combine_thread_queue.add_to_queue(
                     self.project_dir,
                     self.orig_sr,
                     self.orig_channels,
@@ -743,8 +819,6 @@ class MainWindow(QMainWindow):
                     self.on_combine_finished,
                     self.on_worker_error
                 )
-                self.combine_thread.start()
-                return  # Exit to wait for combine to finish
 
         # Update the audio player
         self.update_audio_player(preview_audio_path)
@@ -814,7 +888,8 @@ class MainWindow(QMainWindow):
         # Re-sync playback after combining
         print("Combine finished, regenerating preview audio.")
         self.regenerate_preview_audio()
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
 
     def start_recording(self):
         if not self.project_dir or self.orig_sr is None:
@@ -879,11 +954,12 @@ class MainWindow(QMainWindow):
             )
 
             self.segments.append(seg)
-            self.update_segment_list()
+            QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
             save_project(self.project_dir, self.segments)
 
             if leave_original:
-                self.combine_thread = CombineThread(
+                self.combine_thread_queue.add_to_queue(
                     self.project_dir,
                     self.orig_sr,
                     self.orig_channels,
@@ -891,9 +967,9 @@ class MainWindow(QMainWindow):
                     self.on_combine_finished,
                     self.on_worker_error
                 )
-                self.combine_thread.start()
+
             else:
-                processing_thread = ProcessingThread(
+                self.processing_thread_queue.add_to_queue(
                     self.project_dir,
                     self.orig_sr,
                     self.orig_channels,
@@ -901,8 +977,6 @@ class MainWindow(QMainWindow):
                     self.on_segment_processed,
                     self.on_worker_error
                 )
-                processing_thread.start()
-                self.processing_threads.append(processing_thread)
 
         self.is_recording = False
         self.stop_record_button.setEnabled(False)
@@ -929,11 +1003,12 @@ class MainWindow(QMainWindow):
         seg.processing = not leave_original
         seg.processed_path = seg.recording_path if leave_original else None
 
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         save_project(self.project_dir, self.segments)
 
         if leave_original:
-            self.combine_thread = CombineThread(
+            self.combine_thread_queue.add_to_queue(
                 self.project_dir,
                 self.orig_sr,
                 self.orig_channels,
@@ -941,9 +1016,8 @@ class MainWindow(QMainWindow):
                 self.on_combine_finished,
                 self.on_worker_error
             )
-            self.combine_thread.start()
         else:
-            processing_thread = ProcessingThread(
+            self.processing_thread_queue.add_to_queue(
                 self.project_dir,
                 self.orig_sr,
                 self.orig_channels,
@@ -951,8 +1025,6 @@ class MainWindow(QMainWindow):
                 self.on_segment_processed,
                 self.on_worker_error
             )
-            processing_thread.start()
-            self.processing_threads.append(processing_thread)
 
     def on_segment_processed(self, processed_path, rec_path):
         # Update the processed segment
@@ -963,11 +1035,12 @@ class MainWindow(QMainWindow):
                 seg.processed_path = processed_path
                 break
 
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         save_project(self.project_dir, self.segments)
 
         # Recombine segments to update preview audio
-        self.combine_thread = CombineThread(
+        self.combine_thread_queue.add_to_queue(
             self.project_dir,
             self.orig_sr,
             self.orig_channels,
@@ -975,8 +1048,8 @@ class MainWindow(QMainWindow):
             self.on_combine_finished,
             self.on_worker_error
         )
-        self.combine_thread.start()
 
+    @Slot()
     def update_segment_list(self):
         self.segment_list.clear()
         for seg in self.segments:
@@ -987,9 +1060,10 @@ class MainWindow(QMainWindow):
         if idx < 0:
             return
         self.segments.pop(idx)
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         save_project(self.project_dir, self.segments)
-        self.combine_thread = CombineThread(
+        self.combine_thread_queue.add_to_queue(
             self.project_dir,
             self.orig_sr,
             self.orig_channels,
@@ -997,7 +1071,6 @@ class MainWindow(QMainWindow):
             self.on_combine_finished,
             self.on_worker_error
         )
-        self.combine_thread.start()
 
     def new_project(self):
         self.close_all_threads()
@@ -1019,7 +1092,8 @@ class MainWindow(QMainWindow):
         self.player_video.setSource(QUrl.fromLocalFile(target_video))
         self.player_video.pause()
         self.player_audio.pause()
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         save_project(self.project_dir, self.segments)
         print(f"New project created: {self.project_dir}")
 
@@ -1050,7 +1124,8 @@ class MainWindow(QMainWindow):
         self.regenerate_preview_audio()
         self.player_video.pause()
         self.player_audio.pause()
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         print(f"Project loaded: {self.project_dir}")
 
     def close_all_threads(self):
@@ -1093,7 +1168,8 @@ class MainWindow(QMainWindow):
         self.orig_sr = sr
         self.orig_channels = channels
         self.segments = []
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
         self.player_video.setSource(QUrl.fromLocalFile(target_video))
         self.regenerate_preview_audio()
         self.player_video.pause()
@@ -1157,7 +1233,8 @@ class MainWindow(QMainWindow):
         # Re-sync playback after combining
         print("Combine finished, regenerating preview audio.")
         self.regenerate_preview_audio()
-        self.update_segment_list()
+        QMetaObject.invokeMethod(self, "update_segment_list", Qt.QueuedConnection)
+
 
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.LoadedMedia:
