@@ -1,4 +1,4 @@
-# Multi-Voice Dubbing Editor
+# Voiceover Alchemist
 
 ![изображение](https://github.com/user-attachments/assets/40633119-a594-41dc-b9aa-8666f408ed62)
 
