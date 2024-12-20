@@ -1,5 +1,8 @@
 # Multi-Voice Dubbing Editor
 
+![изображение](https://github.com/user-attachments/assets/40633119-a594-41dc-b9aa-8666f408ed62)
+
+
 The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickly record voiceovers, and change voices via RVC post-processing.
 
 ## Features
@@ -19,10 +22,12 @@ The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickl
 - Pip 24.0
 - FFmpeg
 
+
 ### Dependencies
 
 Install the following libraries using pip:
 
+- `rvc` - Currently, there is a requirement of python & pip versions, see requirements
 - `numpy`
 - `PySide6`
 - `pyaudio`
@@ -57,6 +62,13 @@ Additionally, ensure **FFmpeg** is installed and available in your system's PATH
    python -m ensurepip
    python -m pip install --upgrade pip
    ```
+
+4. Initialize/Install models
+
+   ```bash
+   python full_init.py
+   ```
+
 ---
 
 ## Usage
