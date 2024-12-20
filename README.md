@@ -3,7 +3,7 @@
 ![изображение](https://github.com/user-attachments/assets/40633119-a594-41dc-b9aa-8666f408ed62)
 
 
-The **Multi-Voice Dubbing Editor** is an audio dubbing editor designed to quickly record voiceovers, and change voices via RVC post-processing.
+The **Voiceover Alchemist** is an audio dubbing editor designed to quickly record voiceovers, and change voices via RVC post-processing.
 
 ## Features
 
