@@ -574,7 +574,7 @@ H: Show this help
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("voiceover alchemy")  # Rename the window as requested
+        self.setWindowTitle("Voiceover Alchemist")
 
         self.project_dir = None
         self.segments = []
