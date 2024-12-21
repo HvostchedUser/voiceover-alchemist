@@ -10,7 +10,7 @@ load_dotenv(".env")
 vc = VC()
 
 try:
-    model_name = "ezhikgolos"
+    model_name = "model"
 
     # Load the only .pth file in the folder
     pth_files = list(Path(f"assets/models/{model_name}/").glob("*.pth"))
