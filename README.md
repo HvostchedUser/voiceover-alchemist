@@ -3,12 +3,13 @@
 ![изображение](https://github.com/user-attachments/assets/40633119-a594-41dc-b9aa-8666f408ed62)
 
 
-The **Voiceover Alchemist** is an audio dubbing editor designed to quickly record voiceovers, and change voices via RVC post-processing.
+The **Voiceover Alchemist** is an audio dubbing editor designed to quickly record voiceovers, remove voice from original video, and change voices via RVC post-processing.
 
 ## Features
 
 - **Audio Segments:** Record and process audio segments for voiceover.
 - **Voice Model Integration:** Apply different voice models to audio segments.
+- **Voice Removal:** Remove voices from the underlying video.
 - **Video Export:** Combine video and processed audio into a single output file.
 - **Real-Time Playback:** Synchronize audio and video during playback.
 
@@ -85,9 +86,11 @@ Additionally, ensure **FFmpeg** is installed and available in your system's PATH
 
 1. **Create or Open a Project:** Use the toolbar to create a new project or load an existing one.
 2. **Import Video:** Import a video file to extract audio and begin editing.
-3. **Record Audio Segments:** Record audio segments in synchronization with the video.
-4. **Apply Voice Models:** Select voice models and process the audio.
+4. **Choose Voice Models:** Select voice models and process the audio. The RVC models are stored in the assets/models directory.
+3. **Record Audio Segments:** Record audio segments in synchronization with the video. The voice from the video will be removed and replaced with your voice or any RVC-based voice
 5. **Preview and Export:** Preview the combined audio and export the video.
+
+**Note:** Some of the features when used at the first time might require downloading of additional models, please be patient and read the logs in the console to see what's going on!
 
 ---
 
