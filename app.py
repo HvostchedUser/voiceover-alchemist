@@ -80,7 +80,10 @@ def process_audio(input_file, models, final_output_name="output_final.wav"):
     """
     Process an audio file with a chain of models sequentially.
     """
-    separator = Separator()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    target_dir = os.path.join(script_dir, "assets", "uvr5_weights")
+    separator = Separator(model_file_dir = target_dir)
     temp_dir = tempfile.mkdtemp()
     logging.debug(f"Using temporary directory: {temp_dir}")
 
@@ -910,9 +913,16 @@ class MainWindow(QMainWindow):
         idx = self.segment_list.row(item)
         if idx < 0 or idx >= len(self.segments):
             return
+
         seg = self.segments[idx]
+        # Pause playback
         self.player_video.pause()
         self.player_audio.pause()
+
+        # Update the play/pause button text to "Play"
+        self.play_pause_button.setText("Play")
+
+        # Jump to segment start
         pos_ms = int(seg.start_time * 1000)
         self.player_video.setPosition(pos_ms)
         self.player_audio.setPosition(pos_ms)
