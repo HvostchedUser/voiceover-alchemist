@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+from contextlib import contextmanager
 import sys
 import os
 import time
@@ -6,18 +6,13 @@ import json
 import threading
 import shutil
 from pathlib import Path
+from dotenv import load_dotenv
+from subprocess import run, PIPE
+import numpy as np
+import queue
 import tempfile
 import uuid
-import queue
-import concurrent.futures  # For offloading heavy processing
-import logging
-
-import numpy as np
-
-from subprocess import run, PIPE
-from contextlib import contextmanager
-
-from dotenv import load_dotenv
+import concurrent.futures  # NEW: For offloading heavy processing
 
 from PySide6.QtCore import (
     Qt, QUrl, Signal, Slot, QObject, QMetaObject, Q_ARG, QTimer
@@ -27,7 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QComboBox, QSlider, QListWidget,
     QSplitter, QToolBar, QFileDialog, QDialog, QPlainTextEdit,
-    QSpinBox, QMessageBox, QSizePolicy
+    QSpinBox, QMessageBox, QMenuBar, QSizePolicy
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -37,9 +32,6 @@ import wave
 from scipy.io import wavfile
 import librosa
 import soundfile as sf
-
-# Initialize logging
-logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 
 load_dotenv(".env")
 
@@ -68,28 +60,31 @@ def locked_file_operation():
 def safe_wavfile_write(filepath, sample_rate, audio_data):
     with locked_file_operation():
         wavfile.write(filepath, sample_rate, audio_data)
-        logging.debug(f"File written successfully: {filepath}")
+        print(f"File written successfully: {filepath}")
 
 def safe_wavfile_read(filepath):
     with locked_file_operation():
         sr, data = wavfile.read(filepath)
-        logging.debug(f"File read successfully: {filepath}")
+        print(f"File read successfully: {filepath}")
         return sr, data
+
+separator = Separator()
+vc = VC()
 
 def process_audio(input_file, models, final_output_name="output_final.wav"):
     """
     Process an audio file with a chain of models sequentially.
     """
-    separator = Separator()
+    global separator
     temp_dir = tempfile.mkdtemp()
-    logging.debug(f"Using temporary directory: {temp_dir}")
+    print(f"Using temporary directory: {temp_dir}")
 
     current_file = input_file
     try:
         for i, (model, output_index) in enumerate(models):
             separator.load_model(model)
             output_files = separator.separate(current_file)
-            logging.debug(f"Output files from {model}: {output_files}")
+            print(f"Output files from {model}: {output_files}")
             if output_index >= len(output_files):
                 raise ValueError(f"Invalid output index {output_index} for model {model}.")
             current_file = output_files[output_index]
@@ -99,16 +94,16 @@ def process_audio(input_file, models, final_output_name="output_final.wav"):
                 shutil.move(f, temp_path)
 
             current_file = os.path.join(temp_dir, os.path.basename(current_file))
-            logging.debug(f"Processed with {model}: {current_file}")
+            print(f"Processed with {model}: {current_file}")
 
         final_output_path = os.path.join(os.path.dirname(input_file), final_output_name)
         shutil.copy(current_file, final_output_path)
-        logging.debug(f"Final output saved as: {final_output_path}")
+        print(f"Final output saved as: {final_output_path}")
         return final_output_path
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
-            logging.debug(f"Temporary directory {temp_dir} deleted.")
+            print(f"Temporary directory {temp_dir} deleted.")
 
 def remove_voice_from_segment(segment_data_wav_path, model_path="Kim_Vocal_2.onnx"):
     """
@@ -213,11 +208,11 @@ def save_project(project_dir, segments):
         with open(temp_file, "w") as f:
             json.dump(data, f, indent=4)
         os.replace(temp_file, project_file)
-        logging.debug(f"Project saved successfully: {project_file}")
+        print(f"Project saved successfully: {project_file}")
     except Exception as e:
         if os.path.exists(temp_file):
             os.remove(temp_file)
-        logging.error(f"Error saving project: {e}")
+        print(f"Error saving project: {e}")
 
 def load_project(project_dir):
     """
@@ -235,135 +230,13 @@ def ensure_project_structure(project_dir):
     os.makedirs(os.path.join(project_dir, RECORDINGS_DIR), exist_ok=True)
     os.makedirs(os.path.join(project_dir, PROCESSED_DIR), exist_ok=True)
 
-# --- New helper function for preview generation ---
-def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_channels, preview_path, preview_generation_id):
-    """
-    Worker function (to be run in a separate process) that regenerates
-    the preview audio by combining the original audio with all segments.
-    """
-    logging.info(f"[Preview Worker] Starting preview generation. Project dir: {project_dir}, preview path: {preview_path}")
-    original_wav_path = os.path.join(project_dir, ORIGINAL_AUDIO)
-    segments = [Segment.from_dict(s) for s in segments_data]
-    combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels)
-    logging.info(f"[Preview Worker] Finished preview generation. Output: {preview_path}")
-    return (preview_path, preview_generation_id)
-
-def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels):
-    """
-    Create a preview audio by first replacing (removing) the voice in all segments,
-    then overlaying the processed segment audio on this modified baseline.
-    """
-    logging.debug("Combining audio in two stages: voice removal then overlaying processed segments")
-    
-    if not os.path.exists(original_wav_path):
-        logging.error("Original WAV file does not exist!")
-        return
-
-    # Load the original audio and adjust sample rate/channels as needed.
-    sr, original_data = safe_wavfile_read(original_wav_path)
-    if sr != orig_sr:
-        original_data = resample_audio(original_data, sr, orig_sr)
-        sr = orig_sr
-    original_data = original_data.astype(np.float32)
-    if original_data.ndim == 1 and orig_channels > 1:
-        original_data = np.tile(original_data[:, None], (1, orig_channels))
-    
-    # --- Phase 1: Create baseline with voice removed ---
-    baseline = original_data.copy()
-    for seg in segments:
-        start_sample = int(seg.start_time * orig_sr)
-        end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(baseline):
-            end_sample = len(baseline)
-        
-        # If a voice-removed file exists for this segment, use it.
-        if seg.processed and seg.voice_removed_path is not None:
-            vr_path = os.path.join(project_dir, seg.voice_removed_path)
-            if os.path.exists(vr_path):
-                sr_vr, vr_data = safe_wavfile_read(vr_path)
-                if sr_vr != orig_sr:
-                    vr_data = resample_audio(vr_data, sr_vr, orig_sr)
-                vr_data = vr_data.astype(np.float32)
-                if vr_data.ndim == 1 and orig_channels > 1:
-                    vr_data = np.tile(vr_data[:, None], (1, orig_channels))
-                elif vr_data.ndim > 1 and orig_channels == 1:
-                    vr_data = np.mean(vr_data, axis=1)
-                elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
-                    if vr_data.shape[1] < orig_channels:
-                        vr_data = np.pad(vr_data, ((0, 0), (0, orig_channels - vr_data.shape[1])), mode='constant')
-                    else:
-                        vr_data = vr_data[:, :orig_channels]
-                # Adjust length if needed
-                if vr_data.shape[0] != (end_sample - start_sample):
-                    diff = (end_sample - start_sample) - vr_data.shape[0]
-                    if diff > 0:
-                        vr_data = np.pad(vr_data, ((0, diff), (0, 0)) if vr_data.ndim > 1 else ((0, diff)), mode='constant')
-                    else:
-                        vr_data = vr_data[:end_sample - start_sample]
-                baseline[start_sample:end_sample] = vr_data
-            else:
-                logging.warning(f"Voice-removed file not found for segment at {seg.start_time}-{seg.end_time}s; silencing segment.")
-                baseline[start_sample:end_sample] = 0
-        else:
-            # For segments without a voice-removed file, you may choose to silence them.
-            # baseline[start_sample:end_sample] = 0
-            pass
-
-    # --- Phase 2: Overlay the processed segments on the baseline ---
-    final_audio = baseline.copy()
-    for seg in segments:
-        start_sample = int(seg.start_time * orig_sr)
-        end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(final_audio):
-            end_sample = len(final_audio)
-        
-        # Choose which file to overlay: if processed, use its processed_path; otherwise fall back to the raw recording.
-        if seg.processed and seg.processed_path is not None:
-            seg_audio_file = os.path.join(project_dir, seg.processed_path)
-        else:
-            seg_audio_file = os.path.join(project_dir, seg.recording_path)
-        
-        if os.path.exists(seg_audio_file):
-            sr_seg, seg_data = safe_wavfile_read(seg_audio_file)
-            if sr_seg != orig_sr:
-                seg_data = resample_audio(seg_data, sr_seg, orig_sr)
-            seg_data = seg_data.astype(np.float32)
-            if seg_data.ndim == 1 and orig_channels > 1:
-                seg_data = np.tile(seg_data[:, None], (1, orig_channels))
-            elif seg_data.ndim > 1 and orig_channels == 1:
-                seg_data = np.mean(seg_data, axis=1)
-            elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
-                if seg_data.shape[1] < orig_channels:
-                    seg_data = np.pad(seg_data, ((0, 0), (0, orig_channels - seg_data.shape[1])), mode='constant')
-                else:
-                    seg_data = seg_data[:, :orig_channels]
-            # Adjust segment data length if necessary.
-            if seg_data.shape[0] != (end_sample - start_sample):
-                diff = (end_sample - start_sample) - seg_data.shape[0]
-                if diff > 0:
-                    seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff)), mode='constant')
-                else:
-                    seg_data = seg_data[:end_sample - start_sample]
-            final_audio[start_sample:end_sample] += seg_data
-        else:
-            logging.warning(f"Segment audio file not found: {seg_audio_file}")
-
-    # Normalize to avoid clipping.
-    max_val = np.max(np.abs(final_audio))
-    if max_val > 32767.0:
-        final_audio *= (32767.0 / max_val)
-    final_audio = final_audio.astype(np.int16)
-
-    safe_wavfile_write(preview_path, orig_sr, final_audio)
-    if os.path.exists(preview_path):
-        logging.debug(f"Combined audio written to {preview_path}")
-    else:
-        logging.error("Error: Combined audio file was not created!")
-
-
-# --- Segment processing helper (unchanged) ---
+# --- New helper function to offload processing ---
 def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
-    vc = VC()
+    """
+    Process a segment: perform voice conversion (if needed) and remove the underlying voice.
+    This function is designed to run in a separate process.
+    """
+    # If segment is "original voice", just use the recording.
     if seg.leave_original:
         seg.processed_path = seg.recording_path
     else:
@@ -412,6 +285,7 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
         safe_wavfile_write(full_processed_path, tgt_sr, audio_opt)
         seg.processed_path = processed_path
 
+    # Remove original voice from video portion for this segment
     seg.voice_removed_path = None
     orig_audio_path = os.path.join(project_dir, ORIGINAL_AUDIO)
     sr_o, orig_data = safe_wavfile_read(orig_audio_path)
@@ -430,15 +304,124 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
     shutil.move(voice_removed_temp, voice_removed_path)
     seg.voice_removed_path = voice_removed_path_rel
 
+    # Mark the segment as processed
     seg.processing = False
     seg.processed = True
     return seg
 
-# --- End of helper functions ---
+# --- End of new helper function ---
+
+def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels):
+    """
+    Rebuild the preview audio from the original WAV plus all segments.
+    For segments that are still processing, simply overlay the raw recording.
+    For fully processed segments, first insert the voice-removed portion and then overlay the processed voice.
+    """
+    print("Combine audio with smooth transitions and consistent sample rates")
+    if not os.path.exists(original_wav_path):
+        print("Original WAV file does not exist!")
+        return
+    sr, original_data = safe_wavfile_read(original_wav_path)
+    if sr != orig_sr:
+        original_data = resample_audio(original_data, sr, orig_sr)
+        sr = orig_sr
+    original_data = original_data.astype(np.float32)
+    if original_data.ndim == 1 and orig_channels > 1:
+        original_data = np.tile(original_data[:, None], (1, orig_channels))
+
+    for seg in segments:
+        start_sample = int(seg.start_time * orig_sr)
+        end_sample = int(seg.end_time * orig_sr)
+        if end_sample > len(original_data):
+            end_sample = len(original_data)
+
+        # For processed segments, overlay the voice-removed portion and the processed voice
+        if seg.processed and seg.voice_removed_path is not None:
+            # Insert "voice-removed" portion
+            sr_vr, vr_data = safe_wavfile_read(os.path.join(project_dir, seg.voice_removed_path))
+            if sr_vr != orig_sr:
+                vr_data = resample_audio(vr_data, sr_vr, orig_sr)
+            vr_data = vr_data.astype(np.float32)
+            if vr_data.ndim == 1 and orig_channels > 1:
+                vr_data = np.tile(vr_data[:, None], (1, orig_channels))
+            elif vr_data.ndim > 1 and orig_channels == 1:
+                vr_data = np.mean(vr_data, axis=1)
+            elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
+                if vr_data.shape[1] < orig_channels:
+                    vr_data = np.pad(vr_data, ((0,0),(0, orig_channels - vr_data.shape[1])), mode='constant')
+                else:
+                    vr_data = vr_data[:, :orig_channels]
+
+            if vr_data.shape[0] != (end_sample - start_sample):
+                diff = (end_sample - start_sample) - vr_data.shape[0]
+                if diff > 0:
+                    vr_data = np.pad(vr_data, ((0,diff),(0,0)) if vr_data.ndim > 1 else ((0,diff)), mode='constant')
+                else:
+                    vr_data = vr_data[:end_sample - start_sample]
+            original_data[start_sample:end_sample] = vr_data
+
+            # Overlay the processed voice
+            seg_audio_path = os.path.join(project_dir, seg.processed_path)
+            if os.path.exists(seg_audio_path):
+                sr2, seg_data = safe_wavfile_read(seg_audio_path)
+                if sr2 != orig_sr:
+                    seg_data = resample_audio(seg_data, sr2, orig_sr)
+                seg_data = seg_data.astype(np.float32)
+                if seg_data.ndim == 1 and orig_channels > 1:
+                    seg_data = np.tile(seg_data[:, None], (1, orig_channels))
+                elif seg_data.ndim > 1 and orig_channels == 1:
+                    seg_data = np.mean(seg_data, axis=1)
+                elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
+                    if seg_data.shape[1] < orig_channels:
+                        seg_data = np.pad(seg_data, ((0,0),(0, orig_channels - seg_data.shape[1])), mode='constant')
+                    else:
+                        seg_data = seg_data[:, :orig_channels]
+                if seg_data.shape[0] != (end_sample - start_sample):
+                    diff = (end_sample - start_sample) - seg_data.shape[0]
+                    if diff > 0:
+                        seg_data = np.pad(seg_data, ((0,diff),(0,0)) if seg_data.ndim > 1 else ((0,diff)), mode='constant')
+                    else:
+                        seg_data = seg_data[:end_sample - start_sample]
+                original_data[start_sample:start_sample + seg_data.shape[0]] += seg_data
+        else:
+            # For unprocessed segments, simply overlay the raw recording
+            seg_audio_path = os.path.join(project_dir, seg.recording_path)
+            if os.path.exists(seg_audio_path):
+                sr_rec, rec_data = safe_wavfile_read(seg_audio_path)
+                if sr_rec != orig_sr:
+                    rec_data = resample_audio(rec_data, sr_rec, orig_sr)
+                rec_data = rec_data.astype(np.float32)
+                if rec_data.ndim == 1 and orig_channels > 1:
+                    rec_data = np.tile(rec_data[:, None], (1, orig_channels))
+                elif rec_data.ndim > 1 and orig_channels == 1:
+                    rec_data = np.mean(rec_data, axis=1)
+                elif rec_data.ndim > 1 and rec_data.shape[1] != orig_channels:
+                    if rec_data.shape[1] < orig_channels:
+                        rec_data = np.pad(rec_data, ((0,0),(0, orig_channels - rec_data.shape[1])), mode='constant')
+                    else:
+                        rec_data = rec_data[:, :orig_channels]
+                if rec_data.shape[0] != (end_sample - start_sample):
+                    diff = (end_sample - start_sample) - rec_data.shape[0]
+                    if diff > 0:
+                        rec_data = np.pad(rec_data, ((0,diff),(0,0)) if rec_data.ndim > 1 else ((0,diff)), mode='constant')
+                    else:
+                        rec_data = rec_data[:end_sample - start_sample]
+                original_data[start_sample:start_sample + rec_data.shape[0]] += rec_data
+
+    # Normalize
+    max_val = np.max(np.abs(original_data))
+    if max_val > 32767.0:
+        original_data *= (32767.0 / max_val)
+
+    original_data = original_data.astype(np.int16)
+    safe_wavfile_write(preview_path, orig_sr, original_data)
+    if os.path.exists(preview_path):
+        print(f"Combined audio written to {preview_path}")
+    else:
+        print("Error: Combined audio file was not created!")
 
 class ProcessingTask:
-    def __init__(self, task_type, segment=None, project_dir=None, orig_sr=None, orig_channels=None,
-                 video_path=None, preview_audio_path=None, output_path=None):
+    def __init__(self, task_type, segment=None, project_dir=None, orig_sr=None, orig_channels=None, video_path=None, preview_audio_path=None, output_path=None):
         self.task_type = task_type
         self.segment = segment
         self.project_dir = project_dir
@@ -447,39 +430,31 @@ class ProcessingTask:
         self.video_path = video_path
         self.preview_audio_path = preview_audio_path
         self.output_path = output_path
-        self.segments_data = None
-        self.preview_generation_id = None
-
-class TaskType:
-    PROCESS_SEGMENT = 1
-    EXPORT = 2
-    GENERATE_PREVIEW = 3
-
-# Define task priorities: lower number means higher priority.
-class TaskPriority:
-    GENERATE_PREVIEW = 0
-    PROCESS_SEGMENT = 1
-    EXPORT = 2
 
 class EventEmitter(QObject):
+    """
+    Used to relay events from background threads to the main thread (GUI).
+    """
     processingEvent = Signal(str, dict)
 
 class AudioProcessingManager(threading.Thread):
+    """
+    Thread that processes tasks (like segment processing or video export) one-by-one in a queue.
+    Heavy processing is offloaded to a separate process pool.
+    """
     def __init__(self, callback, error_callback):
         super().__init__(daemon=True)
-        # Use a PriorityQueue so that preview tasks are handled immediately.
-        self.task_queue = queue.PriorityQueue()
+        self.task_queue = queue.Queue()
         self.callback = callback
         self.error_callback = error_callback
         self.stop_flag = threading.Event()
         self.eventEmitter = EventEmitter()
-        self.executor = concurrent.futures.ProcessPoolExecutor()
-        self.task_counter = 0  # counter for ordering tasks with equal priority
+        self.executor = concurrent.futures.ProcessPoolExecutor()  # NEW: persistent process pool
 
     def run(self):
         while not self.stop_flag.is_set():
             try:
-                _, _, task = self.task_queue.get(timeout=0.1)
+                task = self.task_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -487,50 +462,46 @@ class AudioProcessingManager(threading.Thread):
                 self.handle_process_segment(task)
             elif task.task_type == TaskType.EXPORT:
                 self.handle_export(task)
-            elif task.task_type == TaskType.GENERATE_PREVIEW:
-                self.handle_generate_preview(task)
 
             self.task_queue.task_done()
 
     def add_task(self, task):
-        if task.task_type == TaskType.GENERATE_PREVIEW:
-            priority = TaskPriority.GENERATE_PREVIEW
-        elif task.task_type == TaskType.PROCESS_SEGMENT:
-            priority = TaskPriority.PROCESS_SEGMENT
-        elif task.task_type == TaskType.EXPORT:
-            priority = TaskPriority.EXPORT
-        else:
-            priority = 3
-        self.task_counter += 1
-        self.task_queue.put((priority, self.task_counter, task))
+        self.task_queue.put(task)
 
     def stop(self):
         self.stop_flag.set()
-        self.executor.shutdown(wait=False)
+        self.executor.shutdown(wait=False)  # NEW: shutdown executor on stop
 
     def emit_event(self, event_type, data):
         self.eventEmitter.processingEvent.emit(event_type, data)
 
     def handle_process_segment(self, task):
+        """
+        Process a single segment.
+        Heavy work is offloaded to a separate process so that the UI remains responsive.
+        """
         seg = task.segment
         project_dir = task.project_dir
         orig_sr = task.orig_sr
         orig_channels = task.orig_channels
+
         try:
-            logging.info("Processing segment in background.")
             future = self.executor.submit(process_segment_in_subprocess, seg, project_dir, orig_sr, orig_channels)
-            updated_seg = future.result()
+            updated_seg = future.result()  # Wait for the processing result
             seg.processing = updated_seg.processing
             seg.processed = updated_seg.processed
             seg.processed_path = updated_seg.processed_path
             seg.voice_removed_path = updated_seg.voice_removed_path
+
             self.emit_event("segment_done", {"segment": seg})
         except Exception as e:
             self.error_callback(str(e))
 
     def handle_export(self, task):
+        """
+        Export the final video.
+        """
         try:
-            logging.info("Starting video export.")
             result = run([
                 FFMPEG, "-y",
                 "-i", task.video_path,
@@ -541,6 +512,7 @@ class AudioProcessingManager(threading.Thread):
                 "-c:a", "aac",
                 task.output_path
             ], stdout=PIPE, stderr=PIPE, text=True)
+
             if result.returncode != 0:
                 error_msg = result.stderr
                 self.error_callback(error_msg)
@@ -550,24 +522,6 @@ class AudioProcessingManager(threading.Thread):
         except Exception as e:
             self.error_callback(str(e))
             self.emit_event("export_done", {"success": False, "output_path": task.output_path})
-
-    def handle_generate_preview(self, task):
-        try:
-            logging.info("Handling GENERATE_PREVIEW task in background.")
-            future = self.executor.submit(
-                generate_preview_audio_worker,
-                task.project_dir,
-                task.segments_data,
-                task.orig_sr,
-                task.orig_channels,
-                task.preview_audio_path,
-                task.preview_generation_id
-            )
-            result, returned_id = future.result()
-            self.emit_event("preview_generated", {"preview_path": result, "preview_generation_id": returned_id})
-        except Exception as e:
-            self.error_callback(str(e))
-            self.emit_event("preview_generated", {"preview_path": None})
 
 class HotkeyDialog(QDialog):
     def __init__(self, parent=None):
@@ -609,39 +563,42 @@ class MainWindow(QMainWindow):
 
         self.is_recording = False
         self.recording_worker = None
-        self.pending_preview_update = False
-
-        # Track the latest preview generation ID.
-        self.preview_generation_id = 0
 
         self.processing_manager = AudioProcessingManager(
             callback=self.on_processing_callback,
             error_callback=self.on_worker_error
         )
         self.processing_manager.start()
+
+        # Connect events from worker to main thread
         self.processing_manager.eventEmitter.processingEvent.connect(self.on_processing_callback_main_thread)
 
         self.player_video = QMediaPlayer()
-        # Create the audio player once; note that we will re-create it when updating preview.
         self.player_audio = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player_audio.setAudioOutput(self.audio_output)
         self.video_widget = QVideoWidget()
         self.player_video.setVideoOutput(self.video_widget)
 
+        # Toggle button for play/pause
         self.play_pause_button = QPushButton("Play")
+        # Toggle button for start/stop recording
         self.record_toggle_button = QPushButton("Start Recording")
+
         self.remove_button = QPushButton("Remove Selected Segment")
         self.reprocess_button = QPushButton("Reprocess Segment")
+
         self.model_combo = QComboBox()
-        self.model_combo.addItem(ORIGINAL_VOICE_OPTION)
         self.pitch_spinbox = QSpinBox()
         self.pitch_spinbox.setRange(-48,48)
         self.pitch_spinbox.setValue(0)
         self.pitch_spinbox.setToolTip("Pitch shift in semitones (-48 to 48)")
+
         self.timeline_slider = QSlider(Qt.Horizontal)
         self.timeline_slider.setRange(0, 1000)
         self.segment_list = QListWidget()
+
+        # Time counter label
         self.time_label = QLabel("0.00s")
         self.time_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -650,6 +607,7 @@ class MainWindow(QMainWindow):
         self.record_toggle_button.clicked.connect(self.toggle_recording)
         self.remove_button.clicked.connect(self.remove_selected_segment)
         self.reprocess_button.clicked.connect(self.reprocess_selected_segment)
+
         self.player_video.positionChanged.connect(self.on_position_changed)
         self.player_video.durationChanged.connect(self.on_duration_changed)
         self.timeline_slider.sliderMoved.connect(self.on_slider_moved)
@@ -695,14 +653,17 @@ class MainWindow(QMainWindow):
         container.setLayout(container_layout)
         self.setCentralWidget(container)
 
+        # Toolbar setup
         toolbar = QToolBar("Project Toolbar")
         self.addToolBar(toolbar)
+
         create_action = toolbar.addAction("Create Project")
         open_action = toolbar.addAction("Open Project")
         save_action = toolbar.addAction("Save Project")
         import_action = toolbar.addAction("Import Video")
         export_action = toolbar.addAction("Export Video")
         hotkey_action = toolbar.addAction("Hotkeys Help")
+
         create_action.triggered.connect(self.new_project)
         open_action.triggered.connect(self.open_project)
         save_action.triggered.connect(self.save_project_action)
@@ -713,6 +674,7 @@ class MainWindow(QMainWindow):
         self.player_video.pause()
         self.player_audio.pause()
 
+        # Start playback sync in background
         self.sync_thread = threading.Thread(target=self.sync_playback_loop, daemon=True)
         self.sync_queue = queue.Queue()
         self.sync_thread.start()
@@ -721,7 +683,9 @@ class MainWindow(QMainWindow):
         self.pending_position = None
         self.was_playing = False
 
+        # Start the "timer" loop for sync
         self.timer_event()
+
         self.setFocusPolicy(Qt.StrongFocus)
 
     def show_hotkeys(self):
@@ -729,12 +693,19 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def on_processing_callback(self, event_type, data):
+        """
+        Called inside worker thread, do NOT do UI updates here.
+        """
         pass
 
     @Slot(str, dict)
     def on_processing_callback_main_thread(self, event_type, data):
+        """
+        Called in main thread to handle the events from worker.
+        """
         if event_type == "segment_done":
             seg = data["segment"]
+            # Update the segment in memory
             for local_seg in self.segments:
                 if local_seg.recording_path == seg.recording_path:
                     local_seg.processed = seg.processed
@@ -743,10 +714,11 @@ class MainWindow(QMainWindow):
                     local_seg.voice_removed_path = seg.voice_removed_path
                     local_seg.pitch = seg.pitch
                     break
+            # Save the updated project
             if self.project_dir:
                 save_project(self.project_dir, self.segments)
-            # Immediately update preview with raw overlay
-            self.regenerate_preview_audio()
+            # Re-run combine to reflect the new changes
+            self.regenerate_preview_audio(forced=False)
             self.update_segment_list()
 
         elif event_type == "export_done":
@@ -757,25 +729,11 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.information(self, "Exported", f"Video exported to {output_path}")
 
-        elif event_type == "preview_generated":
-            preview_path = data.get("preview_path")
-            returned_id = data.get("preview_generation_id")
-            if returned_id is None or returned_id != self.preview_generation_id:
-                logging.info("Discarding outdated preview generation result.")
-                return
-            if preview_path is None:
-                logging.error("Preview generation failed.")
-                return
-            if self.player_video.playbackState() != QMediaPlayer.PlayingState and not self.is_recording:
-                logging.info("Preview generated and updating audio player immediately.")
-                self.update_audio_player(preview_path)
-                self.pending_preview_update = False
-            else:
-                logging.info("Preview generated but playback/recording is active; update deferred until pause.")
-                self.pending_preview_update = True
-
     @Slot(str)
     def show_error_msg(self, msg):
+        """
+        Show an error message in a QPlainTextEdit for easy copy/paste.
+        """
         dlg = QDialog(self)
         dlg.setWindowTitle("Error")
         layout = QVBoxLayout(dlg)
@@ -790,9 +748,16 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def on_worker_error(self, error_msg):
+        """
+        Called by worker on error in background thread.
+        Use invokeMethod to show error in main thread.
+        """
         QMetaObject.invokeMethod(self, "show_error_msg", Qt.QueuedConnection, Q_ARG(str, error_msg))
 
     def sync_playback_loop(self):
+        """
+        Background loop to sync audio/video every 0.5s.
+        """
         while True:
             time.sleep(0.5)
             self.sync_queue.put(None)
@@ -802,44 +767,25 @@ class MainWindow(QMainWindow):
             self.sync_queue.get()
             self.sync_playback()
 
-    def regenerate_preview_audio(self):
+    def regenerate_preview_audio(self, forced=True):
+        """
+        Rebuild the preview audio from segments if needed.
+        """
         if not self.project_dir or self.orig_sr is None:
-            logging.info("Project or original sample rate not set, skipping preview regeneration.")
             return
-        self.preview_generation_id += 1
-        current_id = self.preview_generation_id
         preview_audio_path = os.path.join(self.project_dir, PREVIEW_AUDIO)
-        segments_data = [seg.to_dict() for seg in self.segments]
-        task = ProcessingTask(
-            TaskType.GENERATE_PREVIEW,
-            project_dir=self.project_dir,
-            orig_sr=self.orig_sr,
-            orig_channels=self.orig_channels,
-            preview_audio_path=preview_audio_path
-        )
-        task.segments_data = segments_data
-        task.preview_generation_id = current_id
-        self.processing_manager.add_task(task)
-        logging.info("Scheduled preview audio regeneration in background.")
+
+        # Re-combine using all segments (some might be processed)
+        orig_audio_path = os.path.join(self.project_dir, ORIGINAL_AUDIO)
+        combine_audio(orig_audio_path, self.segments, self.project_dir, preview_audio_path, self.orig_sr, self.orig_channels)
+        self.update_audio_player(preview_audio_path)
 
     def update_audio_player(self, preview_path):
-        # Re-create the audio player to force a fresh load.
-        try:
-            self.player_audio.stop()
-            self.player_audio.deleteLater()
-        except Exception as e:
-            logging.error("Error deleting old player_audio: " + str(e))
-        self.player_audio = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player_audio.setAudioOutput(self.audio_output)
-        # Reconnect media status signal.
+        self.player_audio.mediaStatusChanged.disconnect(self.on_media_status_changed)
         self.player_audio.mediaStatusChanged.connect(self.on_media_status_changed)
-        # Set the new source.
+        self.player_audio.stop()
         self.player_audio.setSource(QUrl.fromLocalFile(preview_path))
-        logging.debug(f"Set new preview audio source: {preview_path}")
-        # If video is playing, start audio playback.
-        if self.player_video.playbackState() == QMediaPlayer.PlayingState:
-            self.player_audio.play()
+        print(f"Set new preview audio source: {preview_path}")
 
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.LoadedMedia:
@@ -860,31 +806,38 @@ class MainWindow(QMainWindow):
         return self.model_combo.currentText() == ORIGINAL_VOICE_OPTION
 
     def toggle_play_pause(self):
+        """
+        Toggle between playing and pausing the video/audio.
+        Added a short timer callback after play to help ensure audio sync.
+        """
         if self.player_video.playbackState() == QMediaPlayer.PlayingState:
+            # Pause
             self.player_video.pause()
             self.player_audio.pause()
+            # If recording, stop recording on pause
             if self.is_recording:
                 self.stop_recording()
                 self.record_toggle_button.setText("Start Recording")
             self.play_pause_button.setText("Play")
-            if self.pending_preview_update:
-                preview_audio_path = os.path.join(self.project_dir, PREVIEW_AUDIO)
-                self.update_audio_player(preview_audio_path)
-                self.pending_preview_update = False
-                logging.info("Updated preview audio after pausing playback.")
         else:
+            # Play
             self.player_video.play()
             self.player_audio.play()
-            QTimer.singleShot(100, self.sync_playback)
+            QTimer.singleShot(100, self.sync_playback)  # NEW: ensure audio/video sync after play
             self.play_pause_button.setText("Pause")
 
     def toggle_recording(self):
+        """
+        Toggle between starting and stopping the recording.
+        """
         if not self.is_recording:
+            # Scroll 1s back if possible
             pos = self.player_video.position() - 1000
             if pos < 0:
                 pos = 0
             self.player_video.setPosition(pos)
             self.player_audio.setPosition(pos)
+
             self.start_recording()
             self.record_toggle_button.setText("Stop Recording")
         else:
@@ -904,7 +857,7 @@ class MainWindow(QMainWindow):
         self.player_video.setPosition(position)
         self.player_audio.setPosition(position)
         self.time_label.setText(f"{position/1000:.2f}s")
-        QTimer.singleShot(50, self.sync_playback)
+        QTimer.singleShot(50, self.sync_playback)  # ensure sync after seek
 
     def on_segment_selected(self, item):
         idx = self.segment_list.row(item)
@@ -943,6 +896,7 @@ class MainWindow(QMainWindow):
             recording_error
         )
         self.recording_worker.start()
+
         if self.player_video.playbackState() != QMediaPlayer.PlayingState:
             self.player_video.play()
             self.player_audio.play()
@@ -964,6 +918,7 @@ class MainWindow(QMainWindow):
         else:
             model_name = self.model_combo.currentText() or ORIGINAL_VOICE_OPTION
             leave_original = self.is_original_voice_selected()
+
             seg = Segment(
                 start_time,
                 end_time,
@@ -976,11 +931,15 @@ class MainWindow(QMainWindow):
                 voice_removed_path=None,
                 pitch=self.pitch_spinbox.value()
             )
+
             self.segments.append(seg)
             self.update_segment_list()
             save_project(self.project_dir, self.segments)
-            # Immediately update preview with the raw segment overlay.
-            self.regenerate_preview_audio()
+            
+            # Immediately update preview audio using the raw recording overlay
+            self.regenerate_preview_audio(forced=False)
+
+            # Add to queue for heavy processing
             task = ProcessingTask(
                 TaskType.PROCESS_SEGMENT,
                 segment=seg,
@@ -989,10 +948,14 @@ class MainWindow(QMainWindow):
                 orig_channels=self.orig_channels
             )
             self.processing_manager.add_task(task)
+
         self.is_recording = False
         self.record_toggle_button.setText("Start Recording")
 
     def stop_recording(self):
+        """
+        Stop the current recording if active.
+        """
         if not self.is_recording:
             return
         self.is_recording = False
@@ -1006,6 +969,7 @@ class MainWindow(QMainWindow):
         seg = self.segments[idx]
         model_name = self.model_combo.currentText()
         leave_original = self.is_original_voice_selected()
+
         seg.model_name = model_name
         seg.leave_original = leave_original
         seg.processed = False
@@ -1013,8 +977,10 @@ class MainWindow(QMainWindow):
         seg.processed_path = None
         seg.voice_removed_path = None
         seg.pitch = self.pitch_spinbox.value()
+
         self.update_segment_list()
         save_project(self.project_dir, self.segments)
+
         task = ProcessingTask(
             TaskType.PROCESS_SEGMENT,
             segment=seg,
@@ -1031,6 +997,8 @@ class MainWindow(QMainWindow):
         self.segments.pop(idx)
         save_project(self.project_dir, self.segments)
         self.update_segment_list()
+
+        # Re-combine to ensure the removed segment is no longer in preview
         if self.project_dir and self.orig_sr is not None:
             orig_audio_path = os.path.join(self.project_dir, ORIGINAL_AUDIO)
             preview_path = os.path.join(self.project_dir, PREVIEW_AUDIO)
@@ -1059,8 +1027,8 @@ class MainWindow(QMainWindow):
         self.player_audio.pause()
         self.update_segment_list()
         save_project(self.project_dir, self.segments)
-        self.regenerate_preview_audio()
-        logging.info(f"New project created: {self.project_dir}")
+        self.regenerate_preview_audio(forced=False)
+        print(f"New project created: {self.project_dir}")
 
     def open_project(self):
         self.close_all_threads()
@@ -1089,11 +1057,8 @@ class MainWindow(QMainWindow):
         self.player_video.pause()
         self.player_audio.pause()
         self.update_segment_list()
-        preview_path = os.path.join(self.project_dir, PREVIEW_AUDIO)
-        if os.path.exists(preview_path):
-            self.update_audio_player(preview_path)
-        self.regenerate_preview_audio()
-        logging.info(f"Project loaded: {self.project_dir}")
+        self.regenerate_preview_audio(forced=False)
+        print(f"Project loaded: {self.project_dir}")
 
     def close_all_threads(self):
         if self.recording_worker and self.recording_worker.is_alive():
@@ -1124,7 +1089,7 @@ class MainWindow(QMainWindow):
         self.update_segment_list()
         self.player_video.setSource(QUrl.fromLocalFile(target_video))
         shutil.copyfile(os.path.join(self.project_dir, ORIGINAL_AUDIO), os.path.join(self.project_dir, PREVIEW_AUDIO))
-        self.regenerate_preview_audio()
+        self.regenerate_preview_audio(forced=False)
         self.player_video.pause()
         self.player_audio.pause()
 
@@ -1137,6 +1102,7 @@ class MainWindow(QMainWindow):
             return
         video_path = os.path.join(self.project_dir, VIDEO_FILE)
         preview_audio_path = os.path.join(self.project_dir, PREVIEW_AUDIO)
+
         task = ProcessingTask(
             TaskType.EXPORT,
             project_dir=self.project_dir,
@@ -1168,6 +1134,7 @@ class MainWindow(QMainWindow):
         self.timer_event()
 
     def update_segment_list(self):
+        # Sort segments by start time
         self.segments.sort(key=lambda seg: seg.start_time)
         self.segment_list.clear()
         for seg in self.segments:
@@ -1210,6 +1177,9 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
 class RecordingWorker(threading.Thread):
+    """
+    Thread that records audio from microphone until stop is called.
+    """
     def __init__(self, output_path, record_sr, record_channels, finished_callback, error_callback):
         super().__init__()
         self.output_path = output_path
@@ -1236,12 +1206,14 @@ class RecordingWorker(threading.Thread):
             stream.stop_stream()
             stream.close()
             p.terminate()
+
             wf = wave.open(self.output_path, 'wb')
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(p.get_sample_size(FORMAT))
             wf.setframerate(RATE)
             wf.writeframes(b''.join(frames))
             wf.close()
+
             self.finished_callback(True)
         except Exception as e:
             self.error_callback(str(e))
@@ -1249,6 +1221,10 @@ class RecordingWorker(threading.Thread):
 
     def stop(self):
         self._stop_flag.set()
+
+class TaskType:
+    PROCESS_SEGMENT = 1
+    EXPORT = 2
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

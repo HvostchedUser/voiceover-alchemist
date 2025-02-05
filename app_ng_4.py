@@ -250,16 +250,16 @@ def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_chan
 
 def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels):
     """
-    Create a preview audio by first replacing (removing) the voice in all segments,
-    then overlaying the processed segment audio on this modified baseline.
+    Rebuild the preview audio from the original WAV plus all segments.
+    In this version, we first remove the original voice under every segment (by applying
+    the precomputed voice removal deltas) and then add in each segment’s voice.
+    This avoids one segment overwriting another.
     """
-    logging.debug("Combining audio in two stages: voice removal then overlaying processed segments")
-    
+    logging.debug("Combine audio with smooth transitions and consistent sample rates")
     if not os.path.exists(original_wav_path):
         logging.error("Original WAV file does not exist!")
         return
 
-    # Load the original audio and adjust sample rate/channels as needed.
     sr, original_data = safe_wavfile_read(original_wav_path)
     if sr != orig_sr:
         original_data = resample_audio(original_data, sr, orig_sr)
@@ -268,93 +268,101 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
     if original_data.ndim == 1 and orig_channels > 1:
         original_data = np.tile(original_data[:, None], (1, orig_channels))
     
-    # --- Phase 1: Create baseline with voice removed ---
-    baseline = original_data.copy()
+    # Create a working copy for combining
+    combined_data = original_data.copy()
+    
+    # First pass: For every segment with a precomputed voice removal,
+    # calculate the delta needed to remove the original voice.
+    delta = np.zeros_like(combined_data)
     for seg in segments:
         start_sample = int(seg.start_time * orig_sr)
         end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(baseline):
-            end_sample = len(baseline)
-        
-        # If a voice-removed file exists for this segment, use it.
+        if end_sample > len(combined_data):
+            end_sample = len(combined_data)
+        region_length = end_sample - start_sample
+        if region_length <= 0:
+            continue
+
         if seg.processed and seg.voice_removed_path is not None:
-            vr_path = os.path.join(project_dir, seg.voice_removed_path)
-            if os.path.exists(vr_path):
-                sr_vr, vr_data = safe_wavfile_read(vr_path)
-                if sr_vr != orig_sr:
-                    vr_data = resample_audio(vr_data, sr_vr, orig_sr)
-                vr_data = vr_data.astype(np.float32)
-                if vr_data.ndim == 1 and orig_channels > 1:
-                    vr_data = np.tile(vr_data[:, None], (1, orig_channels))
-                elif vr_data.ndim > 1 and orig_channels == 1:
-                    vr_data = np.mean(vr_data, axis=1)
-                elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
-                    if vr_data.shape[1] < orig_channels:
-                        vr_data = np.pad(vr_data, ((0, 0), (0, orig_channels - vr_data.shape[1])), mode='constant')
-                    else:
-                        vr_data = vr_data[:, :orig_channels]
-                # Adjust length if needed
-                if vr_data.shape[0] != (end_sample - start_sample):
-                    diff = (end_sample - start_sample) - vr_data.shape[0]
-                    if diff > 0:
-                        vr_data = np.pad(vr_data, ((0, diff), (0, 0)) if vr_data.ndim > 1 else ((0, diff)), mode='constant')
-                    else:
-                        vr_data = vr_data[:end_sample - start_sample]
-                baseline[start_sample:end_sample] = vr_data
-            else:
-                logging.warning(f"Voice-removed file not found for segment at {seg.start_time}-{seg.end_time}s; silencing segment.")
-                baseline[start_sample:end_sample] = 0
-        else:
-            # For segments without a voice-removed file, you may choose to silence them.
-            # baseline[start_sample:end_sample] = 0
-            pass
+            vr_full_path = os.path.join(project_dir, seg.voice_removed_path)
+            if not os.path.exists(vr_full_path):
+                continue
+            sr_vr, vr_data = safe_wavfile_read(vr_full_path)
+            if sr_vr != orig_sr:
+                vr_data = resample_audio(vr_data, sr_vr, orig_sr)
+            vr_data = vr_data.astype(np.float32)
+            # Adjust dimensions as needed
+            if vr_data.ndim == 1 and orig_channels > 1:
+                vr_data = np.tile(vr_data[:, None], (1, orig_channels))
+            elif vr_data.ndim > 1 and orig_channels == 1:
+                vr_data = np.mean(vr_data, axis=1)
+            elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
+                if vr_data.shape[1] < orig_channels:
+                    vr_data = np.pad(vr_data, ((0,0),(0, orig_channels - vr_data.shape[1])), mode='constant')
+                else:
+                    vr_data = vr_data[:, :orig_channels]
+            # Ensure vr_data matches the region length
+            if vr_data.shape[0] != region_length:
+                diff = region_length - vr_data.shape[0]
+                if diff > 0:
+                    vr_data = np.pad(vr_data, ((0, diff), (0,0)) if vr_data.ndim > 1 else ((0, diff),), mode='constant')
+                else:
+                    vr_data = vr_data[:region_length]
+            # Compute the delta: what needs to be subtracted from the original
+            original_segment = combined_data[start_sample:end_sample]
+            delta_segment = vr_data - original_segment
+            delta[start_sample:end_sample] += delta_segment
 
-    # --- Phase 2: Overlay the processed segments on the baseline ---
-    final_audio = baseline.copy()
+    # Apply the cumulative voice removal delta to the base audio.
+    combined_data += delta
+
+    # Second pass: Overlay each segment’s voice (either processed or raw recording).
     for seg in segments:
         start_sample = int(seg.start_time * orig_sr)
         end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(final_audio):
-            end_sample = len(final_audio)
-        
-        # Choose which file to overlay: if processed, use its processed_path; otherwise fall back to the raw recording.
+        if end_sample > len(combined_data):
+            end_sample = len(combined_data)
+        region_length = end_sample - start_sample
+        if region_length <= 0:
+            continue
+
+        # Choose processed audio if available; otherwise, use the raw recording.
         if seg.processed and seg.processed_path is not None:
-            seg_audio_file = os.path.join(project_dir, seg.processed_path)
+            seg_audio_path = os.path.join(project_dir, seg.processed_path)
         else:
-            seg_audio_file = os.path.join(project_dir, seg.recording_path)
-        
-        if os.path.exists(seg_audio_file):
-            sr_seg, seg_data = safe_wavfile_read(seg_audio_file)
-            if sr_seg != orig_sr:
-                seg_data = resample_audio(seg_data, sr_seg, orig_sr)
-            seg_data = seg_data.astype(np.float32)
-            if seg_data.ndim == 1 and orig_channels > 1:
-                seg_data = np.tile(seg_data[:, None], (1, orig_channels))
-            elif seg_data.ndim > 1 and orig_channels == 1:
-                seg_data = np.mean(seg_data, axis=1)
-            elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
-                if seg_data.shape[1] < orig_channels:
-                    seg_data = np.pad(seg_data, ((0, 0), (0, orig_channels - seg_data.shape[1])), mode='constant')
-                else:
-                    seg_data = seg_data[:, :orig_channels]
-            # Adjust segment data length if necessary.
-            if seg_data.shape[0] != (end_sample - start_sample):
-                diff = (end_sample - start_sample) - seg_data.shape[0]
-                if diff > 0:
-                    seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff)), mode='constant')
-                else:
-                    seg_data = seg_data[:end_sample - start_sample]
-            final_audio[start_sample:end_sample] += seg_data
-        else:
-            logging.warning(f"Segment audio file not found: {seg_audio_file}")
+            seg_audio_path = os.path.join(project_dir, seg.recording_path)
+        if not os.path.exists(seg_audio_path):
+            continue
+        sr_seg, seg_data = safe_wavfile_read(seg_audio_path)
+        if sr_seg != orig_sr:
+            seg_data = resample_audio(seg_data, sr_seg, orig_sr)
+        seg_data = seg_data.astype(np.float32)
+        if seg_data.ndim == 1 and orig_channels > 1:
+            seg_data = np.tile(seg_data[:, None], (1, orig_channels))
+        elif seg_data.ndim > 1 and orig_channels == 1:
+            seg_data = np.mean(seg_data, axis=1)
+        elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
+            if seg_data.shape[1] < orig_channels:
+                seg_data = np.pad(seg_data, ((0,0),(0, orig_channels - seg_data.shape[1])), mode='constant')
+            else:
+                seg_data = seg_data[:, :orig_channels]
+        # Ensure seg_data matches the intended region length.
+        if seg_data.shape[0] != region_length:
+            diff = region_length - seg_data.shape[0]
+            if diff > 0:
+                seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff),), mode='constant')
+            else:
+                seg_data = seg_data[:region_length]
+        # Overlay by adding the segment audio.
+        combined_data[start_sample:start_sample + seg_data.shape[0]] += seg_data
 
-    # Normalize to avoid clipping.
-    max_val = np.max(np.abs(final_audio))
+    # Normalize if needed.
+    max_val = np.max(np.abs(combined_data))
     if max_val > 32767.0:
-        final_audio *= (32767.0 / max_val)
-    final_audio = final_audio.astype(np.int16)
+        combined_data *= (32767.0 / max_val)
 
-    safe_wavfile_write(preview_path, orig_sr, final_audio)
+    combined_data = combined_data.astype(np.int16)
+    safe_wavfile_write(preview_path, orig_sr, combined_data)
     if os.path.exists(preview_path):
         logging.debug(f"Combined audio written to {preview_path}")
     else:

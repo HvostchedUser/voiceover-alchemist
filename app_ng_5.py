@@ -306,8 +306,7 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
                 baseline[start_sample:end_sample] = 0
         else:
             # For segments without a voice-removed file, you may choose to silence them.
-            # baseline[start_sample:end_sample] = 0
-            pass
+            baseline[start_sample:end_sample] = 0
 
     # --- Phase 2: Overlay the processed segments on the baseline ---
     final_audio = baseline.copy()

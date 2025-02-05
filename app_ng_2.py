@@ -76,11 +76,14 @@ def safe_wavfile_read(filepath):
         logging.debug(f"File read successfully: {filepath}")
         return sr, data
 
+separator = Separator()
+vc = VC()
+
 def process_audio(input_file, models, final_output_name="output_final.wav"):
     """
     Process an audio file with a chain of models sequentially.
     """
-    separator = Separator()
+    global separator
     temp_dir = tempfile.mkdtemp()
     logging.debug(f"Using temporary directory: {temp_dir}")
 
@@ -250,16 +253,12 @@ def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_chan
 
 def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels):
     """
-    Create a preview audio by first replacing (removing) the voice in all segments,
-    then overlaying the processed segment audio on this modified baseline.
+    Rebuild the preview audio from the original WAV plus all segments.
     """
-    logging.debug("Combining audio in two stages: voice removal then overlaying processed segments")
-    
+    logging.debug("Combine audio with smooth transitions and consistent sample rates")
     if not os.path.exists(original_wav_path):
         logging.error("Original WAV file does not exist!")
         return
-
-    # Load the original audio and adjust sample rate/channels as needed.
     sr, original_data = safe_wavfile_read(original_wav_path)
     if sr != orig_sr:
         original_data = resample_audio(original_data, sr, orig_sr)
@@ -267,103 +266,95 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
     original_data = original_data.astype(np.float32)
     if original_data.ndim == 1 and orig_channels > 1:
         original_data = np.tile(original_data[:, None], (1, orig_channels))
-    
-    # --- Phase 1: Create baseline with voice removed ---
-    baseline = original_data.copy()
+
     for seg in segments:
         start_sample = int(seg.start_time * orig_sr)
         end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(baseline):
-            end_sample = len(baseline)
-        
-        # If a voice-removed file exists for this segment, use it.
+        if end_sample > len(original_data):
+            end_sample = len(original_data)
+
         if seg.processed and seg.voice_removed_path is not None:
-            vr_path = os.path.join(project_dir, seg.voice_removed_path)
-            if os.path.exists(vr_path):
-                sr_vr, vr_data = safe_wavfile_read(vr_path)
-                if sr_vr != orig_sr:
-                    vr_data = resample_audio(vr_data, sr_vr, orig_sr)
-                vr_data = vr_data.astype(np.float32)
-                if vr_data.ndim == 1 and orig_channels > 1:
-                    vr_data = np.tile(vr_data[:, None], (1, orig_channels))
-                elif vr_data.ndim > 1 and orig_channels == 1:
-                    vr_data = np.mean(vr_data, axis=1)
-                elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
-                    if vr_data.shape[1] < orig_channels:
-                        vr_data = np.pad(vr_data, ((0, 0), (0, orig_channels - vr_data.shape[1])), mode='constant')
-                    else:
-                        vr_data = vr_data[:, :orig_channels]
-                # Adjust length if needed
-                if vr_data.shape[0] != (end_sample - start_sample):
-                    diff = (end_sample - start_sample) - vr_data.shape[0]
-                    if diff > 0:
-                        vr_data = np.pad(vr_data, ((0, diff), (0, 0)) if vr_data.ndim > 1 else ((0, diff)), mode='constant')
-                    else:
-                        vr_data = vr_data[:end_sample - start_sample]
-                baseline[start_sample:end_sample] = vr_data
-            else:
-                logging.warning(f"Voice-removed file not found for segment at {seg.start_time}-{seg.end_time}s; silencing segment.")
-                baseline[start_sample:end_sample] = 0
-        else:
-            # For segments without a voice-removed file, you may choose to silence them.
-            # baseline[start_sample:end_sample] = 0
-            pass
-
-    # --- Phase 2: Overlay the processed segments on the baseline ---
-    final_audio = baseline.copy()
-    for seg in segments:
-        start_sample = int(seg.start_time * orig_sr)
-        end_sample = int(seg.end_time * orig_sr)
-        if end_sample > len(final_audio):
-            end_sample = len(final_audio)
-        
-        # Choose which file to overlay: if processed, use its processed_path; otherwise fall back to the raw recording.
-        if seg.processed and seg.processed_path is not None:
-            seg_audio_file = os.path.join(project_dir, seg.processed_path)
-        else:
-            seg_audio_file = os.path.join(project_dir, seg.recording_path)
-        
-        if os.path.exists(seg_audio_file):
-            sr_seg, seg_data = safe_wavfile_read(seg_audio_file)
-            if sr_seg != orig_sr:
-                seg_data = resample_audio(seg_data, sr_seg, orig_sr)
-            seg_data = seg_data.astype(np.float32)
-            if seg_data.ndim == 1 and orig_channels > 1:
-                seg_data = np.tile(seg_data[:, None], (1, orig_channels))
-            elif seg_data.ndim > 1 and orig_channels == 1:
-                seg_data = np.mean(seg_data, axis=1)
-            elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
-                if seg_data.shape[1] < orig_channels:
-                    seg_data = np.pad(seg_data, ((0, 0), (0, orig_channels - seg_data.shape[1])), mode='constant')
+            sr_vr, vr_data = safe_wavfile_read(os.path.join(project_dir, seg.voice_removed_path))
+            if sr_vr != orig_sr:
+                vr_data = resample_audio(vr_data, sr_vr, orig_sr)
+            vr_data = vr_data.astype(np.float32)
+            if vr_data.ndim == 1 and orig_channels > 1:
+                vr_data = np.tile(vr_data[:, None], (1, orig_channels))
+            elif vr_data.ndim > 1 and orig_channels == 1:
+                vr_data = np.mean(vr_data, axis=1)
+            elif vr_data.ndim > 1 and vr_data.shape[1] != orig_channels:
+                if vr_data.shape[1] < orig_channels:
+                    vr_data = np.pad(vr_data, ((0,0),(0, orig_channels - vr_data.shape[1])), mode='constant')
                 else:
-                    seg_data = seg_data[:, :orig_channels]
-            # Adjust segment data length if necessary.
-            if seg_data.shape[0] != (end_sample - start_sample):
-                diff = (end_sample - start_sample) - seg_data.shape[0]
+                    vr_data = vr_data[:, :orig_channels]
+
+            if vr_data.shape[0] != (end_sample - start_sample):
+                diff = (end_sample - start_sample) - vr_data.shape[0]
                 if diff > 0:
-                    seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff)), mode='constant')
+                    vr_data = np.pad(vr_data, ((0,diff),(0,0)) if vr_data.ndim > 1 else ((0,diff)), mode='constant')
                 else:
-                    seg_data = seg_data[:end_sample - start_sample]
-            final_audio[start_sample:end_sample] += seg_data
+                    vr_data = vr_data[:end_sample - start_sample]
+            original_data[start_sample:end_sample] = vr_data
+
+            seg_audio_path = os.path.join(project_dir, seg.processed_path)
+            if os.path.exists(seg_audio_path):
+                sr2, seg_data = safe_wavfile_read(seg_audio_path)
+                if sr2 != orig_sr:
+                    seg_data = resample_audio(seg_data, sr2, orig_sr)
+                seg_data = seg_data.astype(np.float32)
+                if seg_data.ndim == 1 and orig_channels > 1:
+                    seg_data = np.tile(seg_data[:, None], (1, orig_channels))
+                elif seg_data.ndim > 1 and orig_channels == 1:
+                    seg_data = np.mean(seg_data, axis=1)
+                elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
+                    if seg_data.shape[1] < orig_channels:
+                        seg_data = np.pad(seg_data, ((0,0),(0, orig_channels - seg_data.shape[1])), mode='constant')
+                    else:
+                        seg_data = seg_data[:, :orig_channels]
+                if seg_data.shape[0] != (end_sample - start_sample):
+                    diff = (end_sample - start_sample) - seg_data.shape[0]
+                    if diff > 0:
+                        seg_data = np.pad(seg_data, ((0,diff),(0,0)) if seg_data.ndim > 1 else ((0,diff)), mode='constant')
+                    else:
+                        seg_data = seg_data[:end_sample - start_sample]
+                original_data[start_sample:start_sample + seg_data.shape[0]] += seg_data
         else:
-            logging.warning(f"Segment audio file not found: {seg_audio_file}")
+            seg_audio_path = os.path.join(project_dir, seg.recording_path)
+            if os.path.exists(seg_audio_path):
+                sr_rec, rec_data = safe_wavfile_read(seg_audio_path)
+                if sr_rec != orig_sr:
+                    rec_data = resample_audio(rec_data, sr_rec, orig_sr)
+                rec_data = rec_data.astype(np.float32)
+                if rec_data.ndim == 1 and orig_channels > 1:
+                    rec_data = np.tile(rec_data[:, None], (1, orig_channels))
+                elif rec_data.ndim > 1 and orig_channels == 1:
+                    rec_data = np.mean(rec_data, axis=1)
+                elif rec_data.ndim > 1 and rec_data.shape[1] != orig_channels:
+                    if rec_data.shape[1] < orig_channels:
+                        rec_data = np.pad(rec_data, ((0,0),(0, orig_channels - rec_data.shape[1])), mode='constant')
+                    else:
+                        rec_data = rec_data[:, :orig_channels]
+                if rec_data.shape[0] != (end_sample - start_sample):
+                    diff = (end_sample - start_sample) - rec_data.shape[0]
+                    if diff > 0:
+                        rec_data = np.pad(rec_data, ((0,diff),(0,0)) if rec_data.ndim > 1 else ((0,diff)), mode='constant')
+                    else:
+                        rec_data = rec_data[:end_sample - start_sample]
+                original_data[start_sample:start_sample + rec_data.shape[0]] += rec_data
 
-    # Normalize to avoid clipping.
-    max_val = np.max(np.abs(final_audio))
+    max_val = np.max(np.abs(original_data))
     if max_val > 32767.0:
-        final_audio *= (32767.0 / max_val)
-    final_audio = final_audio.astype(np.int16)
+        original_data *= (32767.0 / max_val)
 
-    safe_wavfile_write(preview_path, orig_sr, final_audio)
+    original_data = original_data.astype(np.int16)
+    safe_wavfile_write(preview_path, orig_sr, original_data)
     if os.path.exists(preview_path):
         logging.debug(f"Combined audio written to {preview_path}")
     else:
         logging.error("Error: Combined audio file was not created!")
 
-
 # --- Segment processing helper (unchanged) ---
 def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
-    vc = VC()
     if seg.leave_original:
         seg.processed_path = seg.recording_path
     else:
@@ -455,31 +446,23 @@ class TaskType:
     EXPORT = 2
     GENERATE_PREVIEW = 3
 
-# Define task priorities: lower number means higher priority.
-class TaskPriority:
-    GENERATE_PREVIEW = 0
-    PROCESS_SEGMENT = 1
-    EXPORT = 2
-
 class EventEmitter(QObject):
     processingEvent = Signal(str, dict)
 
 class AudioProcessingManager(threading.Thread):
     def __init__(self, callback, error_callback):
         super().__init__(daemon=True)
-        # Use a PriorityQueue so that preview tasks are handled immediately.
-        self.task_queue = queue.PriorityQueue()
+        self.task_queue = queue.Queue()
         self.callback = callback
         self.error_callback = error_callback
         self.stop_flag = threading.Event()
         self.eventEmitter = EventEmitter()
         self.executor = concurrent.futures.ProcessPoolExecutor()
-        self.task_counter = 0  # counter for ordering tasks with equal priority
 
     def run(self):
         while not self.stop_flag.is_set():
             try:
-                _, _, task = self.task_queue.get(timeout=0.1)
+                task = self.task_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -493,16 +476,7 @@ class AudioProcessingManager(threading.Thread):
             self.task_queue.task_done()
 
     def add_task(self, task):
-        if task.task_type == TaskType.GENERATE_PREVIEW:
-            priority = TaskPriority.GENERATE_PREVIEW
-        elif task.task_type == TaskType.PROCESS_SEGMENT:
-            priority = TaskPriority.PROCESS_SEGMENT
-        elif task.task_type == TaskType.EXPORT:
-            priority = TaskPriority.EXPORT
-        else:
-            priority = 3
-        self.task_counter += 1
-        self.task_queue.put((priority, self.task_counter, task))
+        self.task_queue.put(task)
 
     def stop(self):
         self.stop_flag.set()
@@ -745,7 +719,6 @@ class MainWindow(QMainWindow):
                     break
             if self.project_dir:
                 save_project(self.project_dir, self.segments)
-            # Immediately update preview with raw overlay
             self.regenerate_preview_audio()
             self.update_segment_list()
 
@@ -979,7 +952,6 @@ class MainWindow(QMainWindow):
             self.segments.append(seg)
             self.update_segment_list()
             save_project(self.project_dir, self.segments)
-            # Immediately update preview with the raw segment overlay.
             self.regenerate_preview_audio()
             task = ProcessingTask(
                 TaskType.PROCESS_SEGMENT,
