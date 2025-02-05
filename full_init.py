@@ -94,3 +94,8 @@ if not os.path.exists(env_file_path):
     click.echo(f"{env_file_path} created successfully.")
 else:
     click.echo(f"{env_file_path} already exists, no change")
+
+
+from audio_separator.separator import Separator
+separator = Separator()
+separator.load_model("Kim_Vocal_2.onnx")
