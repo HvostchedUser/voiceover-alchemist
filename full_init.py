@@ -97,5 +97,8 @@ else:
 
 
 from audio_separator.separator import Separator
-separator = Separator()
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+target_dir = os.path.join(script_dir, "assets", "uvr5_weights")
+separator = Separator(model_file_dir = target_dir)
 separator.load_model("Kim_Vocal_2.onnx")
