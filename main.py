@@ -29,7 +29,7 @@ try:
         raise FileNotFoundError("No index file found in the specified directory.")
 
     # Process the audio
-    tgt_sr, audio_opt, times, _ = vc.vc_single(1, Path("input.wav"), index_file=str(index_file), filter_radius=0, rms_mix_rate=0.0, protect=0.5)
+    tgt_sr, audio_opt, times, _ = vc.vc_single(1, Path("input.wav"), index_file=str(index_file), filter_radius=10, rms_mix_rate=0.0, protect=0.5)
     
     # Save the output with proper cleanup
     try:

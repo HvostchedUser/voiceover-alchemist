@@ -11,6 +11,7 @@ import uuid
 import queue
 import concurrent.futures  # For offloading heavy processing
 import logging
+import gc
 
 import numpy as np
 
@@ -83,7 +84,7 @@ def process_audio(input_file, models, final_output_name="output_final.wav"):
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     target_dir = os.path.join(script_dir, "assets", "uvr5_weights")
-    separator = Separator(model_file_dir = target_dir)
+    separator = Separator(model_file_dir=target_dir)
     temp_dir = tempfile.mkdtemp()
     logging.debug(f"Using temporary directory: {temp_dir}")
 
@@ -112,6 +113,9 @@ def process_audio(input_file, models, final_output_name="output_final.wav"):
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logging.debug(f"Temporary directory {temp_dir} deleted.")
+        # Ensure the Separator is released and memory is freed.
+        del separator
+        gc.collect()
 
 def remove_voice_from_segment(segment_data_wav_path, model_path="Kim_Vocal_2.onnx"):
     """
@@ -333,9 +337,9 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
             seg_data = seg_data.astype(np.float32)
             if seg_data.ndim == 1 and orig_channels > 1:
                 seg_data = np.tile(seg_data[:, None], (1, orig_channels))
-            elif seg_data.ndim > 1 and orig_channels == 1:
+            elif seg_data.ndim == 2 and orig_channels == 1:
                 seg_data = np.mean(seg_data, axis=1)
-            elif seg_data.ndim > 1 and seg_data.shape[1] != orig_channels:
+            elif seg_data.ndim == 2 and seg_data.shape[1] != orig_channels:
                 if seg_data.shape[1] < orig_channels:
                     seg_data = np.pad(seg_data, ((0, 0), (0, orig_channels - seg_data.shape[1])), mode='constant')
                 else:
@@ -362,80 +366,94 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
         logging.debug(f"Combined audio written to {preview_path}")
     else:
         logging.error("Error: Combined audio file was not created!")
+    gc.collect()
 
-
-# --- Segment processing helper (unchanged) ---
+# --- Segment processing helper (unchanged except for cleanup) ---
 def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
-    vc = VC()
-    if seg.leave_original:
-        seg.processed_path = seg.recording_path
-    else:
-        model_name = seg.model_name
-        model_dir = Path(MODELS_DIR, model_name)
-        pth_files = list(model_dir.glob("*.pth"))
-        if not pth_files:
-            raise FileNotFoundError("No .pth file found in model directory.")
-        pth_file = pth_files[0]
-        vc.get_vc(str(pth_file))
-        index_files = list(model_dir.glob("*.index"))
-        if not index_files:
-            raise FileNotFoundError("No index file (.index) found in model directory.")
-        index_file = index_files[0]
+    try:
+        vc = VC()
+        if seg.leave_original:
+            seg.processed_path = seg.recording_path
+        else:
+            model_name = seg.model_name
+            model_dir = Path(MODELS_DIR, model_name)
+            pth_files = list(model_dir.glob("*.pth"))
+            if not pth_files:
+                raise FileNotFoundError("No .pth file found in model directory.")
+            pth_file = pth_files[0]
+            vc.get_vc(str(pth_file))
+            index_files = list(model_dir.glob("*.index"))
+            if not index_files:
+                raise FileNotFoundError("No index file (.index) found in model directory.")
+            index_file = index_files[0]
 
-        input_wav = os.path.join(project_dir, seg.recording_path)
-        tgt_sr, audio_opt, times, _ = vc.vc_single(
-            sid=1,
-            input_audio_path=Path(input_wav),
-            index_file=str(index_file),
-            filter_radius=0,
-            rms_mix_rate=0.0,
-            protect=0.5,
-            f0_up_key=seg.pitch
-        )
+            input_wav = os.path.join(project_dir, seg.recording_path)
+            tgt_sr, audio_opt, times, _ = vc.vc_single(
+                sid=1,
+                input_audio_path=Path(input_wav),
+                index_file=str(index_file),
+                filter_radius=0,
+                rms_mix_rate=0.0,
+                protect=0.0,
+                index_rate=0.0,
+                f0_up_key=seg.pitch
+            )
 
-        if orig_sr != tgt_sr:
-            audio_opt = resample_audio(audio_opt, tgt_sr, orig_sr)
-            tgt_sr = orig_sr
+            if orig_sr != tgt_sr:
+                audio_opt = resample_audio(audio_opt, tgt_sr, orig_sr)
+                tgt_sr = orig_sr
 
-        if audio_opt.ndim == 1 and orig_channels > 1:
-            audio_opt = np.tile(audio_opt[:, None], (1, orig_channels))
-        elif audio_opt.ndim == 2 and audio_opt.shape[1] != orig_channels:
-            if audio_opt.shape[1] < orig_channels:
-                audio_opt = np.pad(audio_opt, ((0,0),(0, orig_channels - audio_opt.shape[1])), mode='constant')
-            else:
-                audio_opt = audio_opt[:, :orig_channels]
+            if audio_opt.ndim == 1 and orig_channels > 1:
+                audio_opt = np.tile(audio_opt[:, None], (1, orig_channels))
+            elif audio_opt.ndim == 2 and audio_opt.shape[1] != orig_channels:
+                if audio_opt.shape[1] < orig_channels:
+                    audio_opt = np.pad(audio_opt, ((0,0),(0, orig_channels - audio_opt.shape[1])), mode='constant')
+                else:
+                    audio_opt = audio_opt[:, :orig_channels]
 
-        processed_path = os.path.join(PROCESSED_DIR, f"processed_{int(time.time()*1000)}.wav")
-        full_processed_path = os.path.join(project_dir, processed_path)
-        if audio_opt.dtype != np.int16:
-            max_val = np.max(np.abs(audio_opt))
-            if max_val > 32767:
-                audio_opt = (audio_opt.astype(np.float32)/max_val)*32767
-            audio_opt = audio_opt.astype(np.int16)
-        safe_wavfile_write(full_processed_path, tgt_sr, audio_opt)
-        seg.processed_path = processed_path
+            processed_path = os.path.join(PROCESSED_DIR, f"processed_{int(time.time()*1000)}.wav")
+            full_processed_path = os.path.join(project_dir, processed_path)
+            if audio_opt.dtype != np.int16:
+                max_val = np.max(np.abs(audio_opt))
+                if max_val > 32767:
+                    audio_opt = (audio_opt.astype(np.float32)/max_val)*32767
+                audio_opt = audio_opt.astype(np.int16)
+            safe_wavfile_write(full_processed_path, tgt_sr, audio_opt)
+            seg.processed_path = processed_path
 
-    seg.voice_removed_path = None
-    orig_audio_path = os.path.join(project_dir, ORIGINAL_AUDIO)
-    sr_o, orig_data = safe_wavfile_read(orig_audio_path)
-    if sr_o != orig_sr:
-        orig_data = resample_audio(orig_data, sr_o, orig_sr)
-    start_sample = int(seg.start_time * orig_sr)
-    end_sample = int(seg.end_time * orig_sr)
-    if end_sample > len(orig_data):
-        end_sample = len(orig_data)
-    segment_data = orig_data[start_sample:end_sample]
-    temp_segment_file = os.path.join(tempfile.gettempdir(), f"original_segment_{uuid.uuid4().hex}.wav")
-    safe_wavfile_write(temp_segment_file, orig_sr, segment_data)
-    voice_removed_temp = remove_voice_from_segment(temp_segment_file)
-    voice_removed_path_rel = os.path.join(PROCESSED_DIR, f"voice_removed_{int(time.time()*1000)}.wav")
-    voice_removed_path = os.path.join(project_dir, voice_removed_path_rel)
-    shutil.move(voice_removed_temp, voice_removed_path)
-    seg.voice_removed_path = voice_removed_path_rel
+        seg.voice_removed_path = None
+        orig_audio_path = os.path.join(project_dir, ORIGINAL_AUDIO)
+        sr_o, orig_data = safe_wavfile_read(orig_audio_path)
+        if sr_o != orig_sr:
+            orig_data = resample_audio(orig_data, sr_o, orig_sr)
+        start_sample = int(seg.start_time * orig_sr)
+        end_sample = int(seg.end_time * orig_sr)
+        if end_sample > len(orig_data):
+            end_sample = len(orig_data)
+        segment_data = orig_data[start_sample:end_sample]
+        temp_segment_file = os.path.join(tempfile.gettempdir(), f"original_segment_{uuid.uuid4().hex}.wav")
+        safe_wavfile_write(temp_segment_file, orig_sr, segment_data)
+        voice_removed_temp = remove_voice_from_segment(temp_segment_file)
+        voice_removed_path_rel = os.path.join(PROCESSED_DIR, f"voice_removed_{int(time.time()*1000)}.wav")
+        voice_removed_path = os.path.join(project_dir, voice_removed_path_rel)
+        shutil.move(voice_removed_temp, voice_removed_path)
+        seg.voice_removed_path = voice_removed_path_rel
 
-    seg.processing = False
-    seg.processed = True
-    return seg
+        seg.processing = False
+        seg.processed = True
+        return seg
+    finally:
+        # Ensure VC is explicitly deleted and attempt to free GPU memory if applicable.
+        try:
+            del vc
+        except NameError:
+            pass
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        gc.collect()
 
 # --- End of helper functions ---
 
@@ -476,6 +494,7 @@ class AudioProcessingManager(threading.Thread):
         self.error_callback = error_callback
         self.stop_flag = threading.Event()
         self.eventEmitter = EventEmitter()
+        # Set max_tasks_per_child to 1 so that each worker is replaced after a single task.
         self.executor = concurrent.futures.ProcessPoolExecutor()
         self.task_counter = 0  # counter for ordering tasks with equal priority
 
@@ -883,7 +902,7 @@ class MainWindow(QMainWindow):
 
     def toggle_recording(self):
         if not self.is_recording:
-            pos = self.player_video.position() - 1000
+            pos = self.player_video.position() - 500
             if pos < 0:
                 pos = 0
             self.player_video.setPosition(pos)
@@ -1187,13 +1206,13 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key_Space:
             self.toggle_play_pause()
         elif event.key() == Qt.Key_Left:
-            pos = self.player_video.position() - 5000
+            pos = self.player_video.position() - 1000
             if pos < 0:
                 pos = 0
             self.player_video.setPosition(pos)
             self.player_audio.setPosition(pos)
         elif event.key() == Qt.Key_Right:
-            pos = self.player_video.position() + 5000
+            pos = self.player_video.position() + 1000
             if pos > self.player_video.duration():
                 pos = self.player_video.duration()
             self.player_video.setPosition(pos)
