@@ -9,7 +9,6 @@ from pathlib import Path
 import tempfile
 import uuid
 import queue
-import concurrent.futures  # For offloading heavy processing
 import logging
 import gc
 
@@ -82,7 +81,6 @@ def process_audio(input_file, models, final_output_name="output_final.wav"):
     Process an audio file with a chain of models sequentially.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
     target_dir = os.path.join(script_dir, "assets", "uvr5_weights")
     separator = Separator(model_file_dir=target_dir)
     temp_dir = tempfile.mkdtemp()
@@ -242,6 +240,31 @@ def ensure_project_structure(project_dir):
     os.makedirs(os.path.join(project_dir, RECORDINGS_DIR), exist_ok=True)
     os.makedirs(os.path.join(project_dir, PROCESSED_DIR), exist_ok=True)
 
+# --- Helper to run a function in a new process ---
+def run_in_new_process(fn, *args, **kwargs):
+    """
+    Run a function in a fresh process and return its result.
+    Exceptions raised in the child process are propagated.
+    """
+    import multiprocessing
+    q = multiprocessing.Queue()
+
+    def wrapper(q, *args, **kwargs):
+        try:
+            result = fn(*args, **kwargs)
+            q.put((True, result))
+        except Exception as e:
+            q.put((False, e))
+
+    p = multiprocessing.Process(target=wrapper, args=(q,) + args, kwargs=kwargs)
+    p.start()
+    success, result = q.get()
+    p.join()
+    gc.collect()
+    if not success:
+        raise result
+    return result
+
 # --- New helper function for preview generation ---
 def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_channels, preview_path, preview_generation_id):
     """
@@ -368,7 +391,7 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
         logging.error("Error: Combined audio file was not created!")
     gc.collect()
 
-# --- Segment processing helper (unchanged except for cleanup) ---
+# --- Segment processing helper (with explicit cleanup) ---
 def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
     try:
         vc = VC()
@@ -443,7 +466,6 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
         seg.processed = True
         return seg
     finally:
-        # Ensure VC is explicitly deleted and attempt to free GPU memory if applicable.
         try:
             del vc
         except NameError:
@@ -494,8 +516,6 @@ class AudioProcessingManager(threading.Thread):
         self.error_callback = error_callback
         self.stop_flag = threading.Event()
         self.eventEmitter = EventEmitter()
-        # Set max_tasks_per_child to 1 so that each worker is replaced after a single task.
-        self.executor = concurrent.futures.ProcessPoolExecutor()
         self.task_counter = 0  # counter for ordering tasks with equal priority
 
     def run(self):
@@ -528,7 +548,6 @@ class AudioProcessingManager(threading.Thread):
 
     def stop(self):
         self.stop_flag.set()
-        self.executor.shutdown(wait=False)
 
     def emit_event(self, event_type, data):
         self.eventEmitter.processingEvent.emit(event_type, data)
@@ -540,8 +559,7 @@ class AudioProcessingManager(threading.Thread):
         orig_channels = task.orig_channels
         try:
             logging.info("Processing segment in background.")
-            future = self.executor.submit(process_segment_in_subprocess, seg, project_dir, orig_sr, orig_channels)
-            updated_seg = future.result()
+            updated_seg = run_in_new_process(process_segment_in_subprocess, seg, project_dir, orig_sr, orig_channels)
             seg.processing = updated_seg.processing
             seg.processed = updated_seg.processed
             seg.processed_path = updated_seg.processed_path
@@ -576,7 +594,7 @@ class AudioProcessingManager(threading.Thread):
     def handle_generate_preview(self, task):
         try:
             logging.info("Handling GENERATE_PREVIEW task in background.")
-            future = self.executor.submit(
+            result, returned_id = run_in_new_process(
                 generate_preview_audio_worker,
                 task.project_dir,
                 task.segments_data,
@@ -585,7 +603,6 @@ class AudioProcessingManager(threading.Thread):
                 task.preview_audio_path,
                 task.preview_generation_id
             )
-            result, returned_id = future.result()
             self.emit_event("preview_generated", {"preview_path": result, "preview_generation_id": returned_id})
         except Exception as e:
             self.error_callback(str(e))
@@ -600,8 +617,8 @@ class HotkeyDialog(QDialog):
         edit.setReadOnly(True)
         help_text = """Hotkeys:
 Space: Play/Pause
-Left Arrow: Seek -5s
-Right Arrow: Seek +5s
+Left Arrow: Seek -1s
+Right Arrow: Seek +1s
 R: Start/Stop Recording
 Backspace or Delete: Remove selected segment
 P: Reprocess selected segment
