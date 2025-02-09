@@ -1,0 +1,10 @@
+rvc
+numpy
+PySide6
+pyaudio
+scipy
+librosa
+onnxruntime
+soundfile
+python-dotenv
+audio-separator

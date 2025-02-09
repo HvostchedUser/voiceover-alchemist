@@ -11,6 +11,7 @@ import uuid
 import queue
 import logging
 import gc
+import subprocess
 
 import numpy as np
 
@@ -43,9 +44,15 @@ logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 
 load_dotenv(".env")
 
-# Adjust these imports to match your environment.
+# Import RVC and other modules.
 from rvc.modules.vc.modules import VC
 from audio_separator.separator import Separator
+
+# Import the SeedVC processing function.
+from seedvc_wrapper import process_segment_with_seedvc
+
+# Import shared utilities.
+from utils import safe_wavfile_write, safe_wavfile_read, resample_audio, process_audio, remove_voice_from_segment
 
 FFMPEG = "ffmpeg"
 PROJECT_FILE = "project.json"
@@ -57,105 +64,7 @@ PROCESSED_DIR = "processed"
 MODELS_DIR = "assets/models"
 ORIGINAL_VOICE_OPTION = "<original voice>"
 
-file_lock = threading.Lock()
-
-@contextmanager
-def locked_file_operation():
-    """Thread-safe file operation context."""
-    with file_lock:
-        yield
-
-def safe_wavfile_write(filepath, sample_rate, audio_data):
-    with locked_file_operation():
-        wavfile.write(filepath, sample_rate, audio_data)
-        logging.debug(f"File written successfully: {filepath}")
-
-def safe_wavfile_read(filepath):
-    with locked_file_operation():
-        sr, data = wavfile.read(filepath)
-        logging.debug(f"File read successfully: {filepath}")
-        return sr, data
-
-def process_audio(input_file, models, final_output_name="output_final.wav"):
-    """
-    Process an audio file with a chain of models sequentially.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    target_dir = os.path.join(script_dir, "assets", "uvr5_weights")
-    separator = Separator(model_file_dir=target_dir)
-    temp_dir = tempfile.mkdtemp()
-    logging.debug(f"Using temporary directory: {temp_dir}")
-
-    current_file = input_file
-    try:
-        for i, (model, output_index) in enumerate(models):
-            separator.load_model(model)
-            output_files = separator.separate(current_file)
-            logging.debug(f"Output files from {model}: {output_files}")
-            if output_index >= len(output_files):
-                raise ValueError(f"Invalid output index {output_index} for model {model}.")
-            current_file = output_files[output_index]
-
-            for f in output_files:
-                temp_path = os.path.join(temp_dir, os.path.basename(f))
-                shutil.move(f, temp_path)
-
-            current_file = os.path.join(temp_dir, os.path.basename(current_file))
-            logging.debug(f"Processed with {model}: {current_file}")
-
-        final_output_path = os.path.join(os.path.dirname(input_file), final_output_name)
-        shutil.copy(current_file, final_output_path)
-        logging.debug(f"Final output saved as: {final_output_path}")
-        return final_output_path
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-            logging.debug(f"Temporary directory {temp_dir} deleted.")
-        # Ensure the Separator is released and memory is freed.
-        del separator
-        gc.collect()
-
-def remove_voice_from_segment(segment_data_wav_path, model_path="Kim_Vocal_2.onnx"):
-    """
-    Remove voice from a portion of the original video audio.
-    """
-    temp_output = os.path.join(tempfile.gettempdir(), f"voice_removed_{uuid.uuid4().hex}.wav")
-    models_to_apply = [(model_path, 0)]
-    final_output = process_audio(segment_data_wav_path, models_to_apply, final_output_name=os.path.basename(temp_output))
-    if final_output != temp_output:
-        shutil.copy(final_output, temp_output)
-    return temp_output
-
-def resample_audio(audio, original_sr, target_sr):
-    """
-    Resample audio array from original_sr to target_sr if needed.
-    """
-    if original_sr == target_sr:
-        return audio
-    audio = audio.astype(np.float32) / 32768.0
-    if audio.ndim == 1:
-        resampled = librosa.resample(audio, orig_sr=original_sr, target_sr=target_sr)
-    else:
-        resampled_channels = []
-        for c in range(audio.shape[1]):
-            channel_data = audio[:, c]
-            resampled_channel = librosa.resample(channel_data, orig_sr=original_sr, target_sr=target_sr)
-            resampled_channels.append(resampled_channel)
-        resampled = np.stack(resampled_channels, axis=-1)
-    resampled = (resampled * 32768.0).clip(-32768, 32767).astype(np.int16)
-    return resampled
-
-def extract_audio_from_video(video_path, audio_path):
-    """
-    Extract raw PCM audio from a given video file.
-    """
-    temp_path = audio_path + ".temp.wav"
-    run([FFMPEG, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", temp_path], check=True)
-    sr, data = safe_wavfile_read(temp_path)
-    shutil.move(temp_path, audio_path)
-    channels = data.shape[1] if data.ndim > 1 else 1
-    return sr, channels
-
+# ----------------- Data Model -----------------
 class Segment:
     def __init__(self, start_time, end_time, recording_path, model_name,
                  processed=False, processing=False, leave_original=False,
@@ -208,9 +117,6 @@ class Segment:
         )
 
 def save_project(project_dir, segments):
-    """
-    Save the current list of segments to project.json in a thread-safe manner.
-    """
     project_file = os.path.join(project_dir, PROJECT_FILE)
     temp_file = f"{project_file}.tmp"
     data = {"segments": [s.to_dict() for s in segments]}
@@ -225,27 +131,17 @@ def save_project(project_dir, segments):
         logging.error(f"Error saving project: {e}")
 
 def load_project(project_dir):
-    """
-    Load the project.json and create a list of Segment objects.
-    """
     with open(os.path.join(project_dir, PROJECT_FILE), "r") as f:
         data = json.load(f)
     segments = [Segment.from_dict(d) for d in data["segments"]]
     return segments
 
 def ensure_project_structure(project_dir):
-    """
-    Create required sub-directories in the project if not existing.
-    """
     os.makedirs(os.path.join(project_dir, RECORDINGS_DIR), exist_ok=True)
     os.makedirs(os.path.join(project_dir, PROCESSED_DIR), exist_ok=True)
 
-# --- Helper to run a function in a new process ---
+# ----------------- Process Helpers -----------------
 def run_in_new_process(fn, *args, **kwargs):
-    """
-    Run a function in a fresh process and return its result.
-    Exceptions raised in the child process are propagated.
-    """
     import multiprocessing
     q = multiprocessing.Queue()
 
@@ -265,12 +161,7 @@ def run_in_new_process(fn, *args, **kwargs):
         raise result
     return result
 
-# --- New helper function for preview generation ---
 def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_channels, preview_path, preview_generation_id):
-    """
-    Worker function (to be run in a separate process) that regenerates
-    the preview audio by combining the original audio with all segments.
-    """
     logging.info(f"[Preview Worker] Starting preview generation. Project dir: {project_dir}, preview path: {preview_path}")
     original_wav_path = os.path.join(project_dir, ORIGINAL_AUDIO)
     segments = [Segment.from_dict(s) for s in segments_data]
@@ -279,17 +170,12 @@ def generate_preview_audio_worker(project_dir, segments_data, orig_sr, orig_chan
     return (preview_path, preview_generation_id)
 
 def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_sr, orig_channels):
-    """
-    Create a preview audio by first replacing (removing) the voice in all segments,
-    then overlaying the processed segment audio on this modified baseline.
-    """
-    logging.debug("Combining audio in two stages: voice removal then overlaying processed segments")
+    logging.debug("Combining audio: voice removal then overlaying processed segments")
     
     if not os.path.exists(original_wav_path):
         logging.error("Original WAV file does not exist!")
         return
 
-    # Load the original audio and adjust sample rate/channels as needed.
     sr, original_data = safe_wavfile_read(original_wav_path)
     if sr != orig_sr:
         original_data = resample_audio(original_data, sr, orig_sr)
@@ -298,15 +184,12 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
     if original_data.ndim == 1 and orig_channels > 1:
         original_data = np.tile(original_data[:, None], (1, orig_channels))
     
-    # --- Phase 1: Create baseline with voice removed ---
     baseline = original_data.copy()
     for seg in segments:
         start_sample = int(seg.start_time * orig_sr)
         end_sample = int(seg.end_time * orig_sr)
         if end_sample > len(baseline):
             end_sample = len(baseline)
-        
-        # If a voice-removed file exists for this segment, use it.
         if seg.processed and seg.voice_removed_path is not None:
             vr_path = os.path.join(project_dir, seg.voice_removed_path)
             if os.path.exists(vr_path):
@@ -323,7 +206,6 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
                         vr_data = np.pad(vr_data, ((0, 0), (0, orig_channels - vr_data.shape[1])), mode='constant')
                     else:
                         vr_data = vr_data[:, :orig_channels]
-                # Adjust length if needed
                 if vr_data.shape[0] != (end_sample - start_sample):
                     diff = (end_sample - start_sample) - vr_data.shape[0]
                     if diff > 0:
@@ -335,24 +217,18 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
                 logging.warning(f"Voice-removed file not found for segment at {seg.start_time}-{seg.end_time}s; silencing segment.")
                 baseline[start_sample:end_sample] = 0
         else:
-            # For segments without a voice-removed file, you may choose to silence them.
-            # baseline[start_sample:end_sample] = 0
             pass
 
-    # --- Phase 2: Overlay the processed segments on the baseline ---
     final_audio = baseline.copy()
     for seg in segments:
         start_sample = int(seg.start_time * orig_sr)
         end_sample = int(seg.end_time * orig_sr)
         if end_sample > len(final_audio):
             end_sample = len(final_audio)
-        
-        # Choose which file to overlay: if processed, use its processed_path; otherwise fall back to the raw recording.
         if seg.processed and seg.processed_path is not None:
             seg_audio_file = os.path.join(project_dir, seg.processed_path)
         else:
             seg_audio_file = os.path.join(project_dir, seg.recording_path)
-        
         if os.path.exists(seg_audio_file):
             sr_seg, seg_data = safe_wavfile_read(seg_audio_file)
             if sr_seg != orig_sr:
@@ -367,23 +243,20 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
                     seg_data = np.pad(seg_data, ((0, 0), (0, orig_channels - seg_data.shape[1])), mode='constant')
                 else:
                     seg_data = seg_data[:, :orig_channels]
-            # Adjust segment data length if necessary.
             if seg_data.shape[0] != (end_sample - start_sample):
                 diff = (end_sample - start_sample) - seg_data.shape[0]
                 if diff > 0:
                     seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff)), mode='constant')
                 else:
                     seg_data = seg_data[:end_sample - start_sample]
-            final_audio[start_sample:end_sample] += seg_data*0.7
+            final_audio[start_sample:end_sample] += seg_data * 0.7
         else:
             logging.warning(f"Segment audio file not found: {seg_audio_file}")
 
-    # Normalize to avoid clipping.
     max_val = np.max(np.abs(final_audio))
     if max_val > 32767.0:
         final_audio *= (32767.0 / max_val)
     final_audio = final_audio.astype(np.int16)
-
     safe_wavfile_write(preview_path, orig_sr, final_audio)
     if os.path.exists(preview_path):
         logging.debug(f"Combined audio written to {preview_path}")
@@ -391,14 +264,17 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
         logging.error("Error: Combined audio file was not created!")
     gc.collect()
 
-# --- Segment processing helper (with explicit cleanup) ---
 def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
     try:
-        vc = VC()
         if seg.leave_original:
             seg.processed_path = seg.recording_path
+        elif seg.model_name.startswith("SeedVC:"):
+            seg = process_segment_with_seedvc(seg, project_dir, orig_sr, orig_channels)
         else:
+            vc = VC()
             model_name = seg.model_name
+            if model_name.startswith("RVC:"):
+                model_name = model_name.split("RVC:")[1].strip()
             model_dir = Path(MODELS_DIR, model_name)
             pth_files = list(model_dir.glob("*.pth"))
             if not pth_files:
@@ -409,7 +285,6 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
             if not index_files:
                 raise FileNotFoundError("No index file (.index) found in model directory.")
             index_file = index_files[0]
-
             input_wav = os.path.join(project_dir, seg.recording_path)
             tgt_sr, audio_opt, times, _ = vc.vc_single(
                 sid=1,
@@ -421,11 +296,9 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
                 index_rate=0.0,
                 f0_up_key=seg.pitch
             )
-
             if orig_sr != tgt_sr:
                 audio_opt = resample_audio(audio_opt, tgt_sr, orig_sr)
                 tgt_sr = orig_sr
-
             if audio_opt.ndim == 1 and orig_channels > 1:
                 audio_opt = np.tile(audio_opt[:, None], (1, orig_channels))
             elif audio_opt.ndim == 2 and audio_opt.shape[1] != orig_channels:
@@ -433,7 +306,6 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
                     audio_opt = np.pad(audio_opt, ((0,0),(0, orig_channels - audio_opt.shape[1])), mode='constant')
                 else:
                     audio_opt = audio_opt[:, :orig_channels]
-
             processed_path = os.path.join(PROCESSED_DIR, f"processed_{int(time.time()*1000)}.wav")
             full_processed_path = os.path.join(project_dir, processed_path)
             if audio_opt.dtype != np.int16:
@@ -477,8 +349,7 @@ def process_segment_in_subprocess(seg, project_dir, orig_sr, orig_channels):
             pass
         gc.collect()
 
-# --- End of helper functions ---
-
+# ----------------- Task Management -----------------
 class ProcessingTask:
     def __init__(self, task_type, segment=None, project_dir=None, orig_sr=None, orig_channels=None,
                  video_path=None, preview_audio_path=None, output_path=None):
@@ -498,7 +369,6 @@ class TaskType:
     EXPORT = 2
     GENERATE_PREVIEW = 3
 
-# Define task priorities: lower number means higher priority.
 class TaskPriority:
     GENERATE_PREVIEW = 0
     PROCESS_SEGMENT = 1
@@ -510,13 +380,12 @@ class EventEmitter(QObject):
 class AudioProcessingManager(threading.Thread):
     def __init__(self, callback, error_callback):
         super().__init__(daemon=True)
-        # Use a PriorityQueue so that preview tasks are handled immediately.
         self.task_queue = queue.PriorityQueue()
         self.callback = callback
         self.error_callback = error_callback
         self.stop_flag = threading.Event()
         self.eventEmitter = EventEmitter()
-        self.task_counter = 0  # counter for ordering tasks with equal priority
+        self.task_counter = 0
 
     def run(self):
         while not self.stop_flag.is_set():
@@ -524,14 +393,12 @@ class AudioProcessingManager(threading.Thread):
                 _, _, task = self.task_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-
             if task.task_type == TaskType.PROCESS_SEGMENT:
                 self.handle_process_segment(task)
             elif task.task_type == TaskType.EXPORT:
                 self.handle_export(task)
             elif task.task_type == TaskType.GENERATE_PREVIEW:
                 self.handle_generate_preview(task)
-
             self.task_queue.task_done()
 
     def add_task(self, task):
@@ -608,6 +475,7 @@ class AudioProcessingManager(threading.Thread):
             self.error_callback(str(e))
             self.emit_event("preview_generated", {"preview_path": None})
 
+# ----------------- UI Classes -----------------
 class HotkeyDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -640,17 +508,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Voiceover Alchemist")
-
         self.project_dir = None
         self.segments = []
         self.orig_sr = None
         self.orig_channels = None
-
         self.is_recording = False
         self.recording_worker = None
         self.pending_preview_update = False
-
-        # Track the latest preview generation ID.
         self.preview_generation_id = 0
 
         self.processing_manager = AudioProcessingManager(
@@ -661,7 +525,6 @@ class MainWindow(QMainWindow):
         self.processing_manager.eventEmitter.processingEvent.connect(self.on_processing_callback_main_thread)
 
         self.player_video = QMediaPlayer()
-        # Create the audio player once; note that we will re-create it when updating preview.
         self.player_audio = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player_audio.setAudioOutput(self.audio_output)
@@ -784,10 +647,8 @@ class MainWindow(QMainWindow):
                     break
             if self.project_dir:
                 save_project(self.project_dir, self.segments)
-            # Immediately update preview with raw overlay
             self.regenerate_preview_audio()
             self.update_segment_list()
-
         elif event_type == "export_done":
             success = data["success"]
             output_path = data["output_path"]
@@ -795,7 +656,6 @@ class MainWindow(QMainWindow):
                 self.show_error_msg("Failed to export video.")
             else:
                 QMessageBox.information(self, "Exported", f"Video exported to {output_path}")
-
         elif event_type == "preview_generated":
             preview_path = data.get("preview_path")
             returned_id = data.get("preview_generation_id")
@@ -862,7 +722,6 @@ class MainWindow(QMainWindow):
         logging.info("Scheduled preview audio regeneration in background.")
 
     def update_audio_player(self, preview_path):
-        # Re-create the audio player to force a fresh load.
         try:
             self.player_audio.stop()
             self.player_audio.deleteLater()
@@ -871,12 +730,9 @@ class MainWindow(QMainWindow):
         self.player_audio = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player_audio.setAudioOutput(self.audio_output)
-        # Reconnect media status signal.
         self.player_audio.mediaStatusChanged.connect(self.on_media_status_changed)
-        # Set the new source.
         self.player_audio.setSource(QUrl.fromLocalFile(preview_path))
         logging.debug(f"Set new preview audio source: {preview_path}")
-        # If video is playing, start audio playback.
         if self.player_video.playbackState() == QMediaPlayer.PlayingState:
             self.player_audio.play()
 
@@ -892,8 +748,15 @@ class MainWindow(QMainWindow):
         self.model_combo.clear()
         self.model_combo.addItem(ORIGINAL_VOICE_OPTION)
         if os.path.isdir(MODELS_DIR):
-            dirs = [d for d in os.listdir(MODELS_DIR) if os.path.isdir(os.path.join(MODELS_DIR, d))]
-            self.model_combo.addItems(dirs)
+            rvc_models = [d for d in os.listdir(MODELS_DIR) if os.path.isdir(os.path.join(MODELS_DIR, d))]
+            for m in rvc_models:
+                self.model_combo.addItem("RVC: " + m)
+        seedvc_dir = os.path.join("assets", "seedvc_references")
+        if os.path.isdir(seedvc_dir):
+            seedvc_files = [f for f in os.listdir(seedvc_dir) if f.lower().endswith(('.wav', '.mp3', '.flac'))]
+            for f in seedvc_files:
+                name = os.path.splitext(f)[0]
+                self.model_combo.addItem("SeedVC: " + name)
 
     def is_original_voice_selected(self):
         return self.model_combo.currentText() == ORIGINAL_VOICE_OPTION
@@ -949,16 +812,10 @@ class MainWindow(QMainWindow):
         idx = self.segment_list.row(item)
         if idx < 0 or idx >= len(self.segments):
             return
-
         seg = self.segments[idx]
-        # Pause playback
         self.player_video.pause()
         self.player_audio.pause()
-
-        # Update the play/pause button text to "Play"
         self.play_pause_button.setText("Play")
-
-        # Jump to segment start
         pos_ms = int(seg.start_time * 1000)
         self.player_video.setPosition(pos_ms)
         self.player_audio.setPosition(pos_ms)
@@ -1001,7 +858,6 @@ class MainWindow(QMainWindow):
             self.is_recording = False
             self.record_toggle_button.setText("Start Recording")
             return
-
         end_time = self.player_video.position() / 1000.0
         start_time = self.record_start_time
         duration = end_time - start_time
@@ -1025,7 +881,6 @@ class MainWindow(QMainWindow):
             self.segments.append(seg)
             self.update_segment_list()
             save_project(self.project_dir, self.segments)
-            # Immediately update preview with the raw segment overlay.
             self.regenerate_preview_audio()
             task = ProcessingTask(
                 TaskType.PROCESS_SEGMENT,
