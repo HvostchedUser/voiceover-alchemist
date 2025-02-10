@@ -2,7 +2,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from scipy.io import wavfile
 from rvc.modules.vc.modules import VC
-from rvc.modules.vc.modules import uvr5
 import glob
 import gc  # For garbage collection
 
@@ -10,7 +9,7 @@ load_dotenv(".env")
 vc = VC()
 
 try:
-    model_name = "model"
+    model_name = "kuplinov"
 
     # Load the only .pth file in the folder
     pth_files = list(Path(f"assets/models/{model_name}/").glob("*.pth"))

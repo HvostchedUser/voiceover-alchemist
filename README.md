@@ -30,6 +30,7 @@ Install the following libraries using pip:
 
 - `rvc` - Currently, there is a requirement of python & pip versions, see requirements
 - `numpy`
+- `requests`
 - `PySide6`
 - `pyaudio`
 - `scipy`
@@ -38,6 +39,9 @@ Install the following libraries using pip:
 - `soundfile`
 - `python-dotenv`
 - `audio-separator`
+- `protobuf==3.20.3`
+- `torch==2.1.2`
+- `torchvision`
 
 Additionally, ensure **FFmpeg** is installed and available in your system's PATH.
 
@@ -61,7 +65,7 @@ Additionally, ensure **FFmpeg** is installed and available in your system's PATH
 
    ```bash
    python -m ensurepip
-   python -m pip install --upgrade pip
+   python -m pip install pip==24.0
    ```
 
 4. Initialize/Install models

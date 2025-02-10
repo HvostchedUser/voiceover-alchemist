@@ -374,7 +374,7 @@ def combine_audio(original_wav_path, segments, project_dir, preview_path, orig_s
                     seg_data = np.pad(seg_data, ((0, diff), (0, 0)) if seg_data.ndim > 1 else ((0, diff)), mode='constant')
                 else:
                     seg_data = seg_data[:end_sample - start_sample]
-            final_audio[start_sample:end_sample] += seg_data*0.7
+            final_audio[start_sample:end_sample] += seg_data*0.4
         else:
             logging.warning(f"Segment audio file not found: {seg_audio_file}")
 
